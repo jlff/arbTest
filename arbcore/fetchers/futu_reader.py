@@ -67,6 +67,7 @@ class FutuReader:
         """
         if not FUTU_AVAILABLE:
             return False, "未安装 futu-api 库 (pip install futu-api)", self.prices
+        return False
             
         try:
             # 限制重连频率，避免富途OpenD未启动时狂刷错误
