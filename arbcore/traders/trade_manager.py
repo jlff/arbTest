@@ -9,6 +9,9 @@ _lof_dir = os.path.normpath(os.path.join(_tm_dir, "..", "..", "LOFarb"))
 if os.path.exists(_lof_dir) and _lof_dir not in sys.path:
     sys.path.append(_lof_dir)
 
+import logging
+logger = logging.getLogger(__name__)
+
 # 导入本地敏感配置
 try:
     from account_private import GJS_ACCOUNT
@@ -59,14 +62,14 @@ class TradeManager:
             
             if self.tdx_account_id and self.tdx_account_id > 0:
                 self.tdx_available = True
-                print(f"SUCCESS: [TradeManager] 已挂载【通达信】交易通道 (账户句柄: {self.tdx_account_id})")
+                logger.info(f"[TradeManager] 已挂载【通达信】交易通道 (账户句柄: {self.tdx_account_id})")
             else:
-                print("WARNING: [TradeManager] 通达信账户句柄获取失败")
+                logger.warning("[TradeManager] 通达信账户句柄获取失败")
                 
         except ImportError as e:
-            print(f"INFO: [TradeManager] 未检测到新版通达信环境(tqcenter): {e}")
+            logger.warning(f"[TradeManager] 未检测到新版通达信环境(tqcenter): {e}")
         except Exception as e:
-            print(f"INFO: [TradeManager] 通达信模块跳过加载: {e}")
+            logger.warning(f"[TradeManager] 通达信模块跳过加载: {e}")
 
     # 【国金QMT已注释】用户不使用
     # def _init_guojin_qmt(self):
@@ -100,11 +103,14 @@ class TradeManager:
     #     except Exception as e:
     #         print(f"INFO: [TradeManager] 国金QMT模块跳过加载: {e}")
 
-    def send_order(self, broker, action, symbol, volume, price):
+    def send_order(self, broker, action, symbol, volume, price, account_id=None):
         """暴露给外部的统一路由函数"""
         if broker == 'yinhe_qmt':
             try:
-                cmd_str = f"{action},{symbol},{volume},{price}\n"
+                if account_id:
+                    cmd_str = f"{action},{symbol},{volume},{price},{account_id}\n"
+                else:
+                    cmd_str = f"{action},{symbol},{volume},{price}\n"
                 client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 client.settimeout(2.0)
                 client.connect(('127.0.0.1', 8888))
