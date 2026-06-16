@@ -59,7 +59,7 @@ class FutuReader:
             
         if self.disabled:
             return False, "富途API已被禁用 (连接曾被拒绝)", self.prices
-            
+        return False 
         try:
             # 限制重连频率，避免富途OpenD未启动时狂刷错误
             if self.ctx is None:
