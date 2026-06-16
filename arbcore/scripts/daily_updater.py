@@ -20,9 +20,9 @@ from arbcore.fetchers.woody_web_crawler import WoodyWebCrawler
 from arbcore.fetchers.woody_api_service import WoodyAPIService
 from arbcore.config.account_private import WOODY_USERNAME, WOODY_PASSWORD
 try:
-    from arbcore.config.account_private import VPS_HOST, VPS_PORT, VPS_USER, VPS_PASSWORD, VPS_DATA_DIR
+    from arbcore.config.account_private import VPS_HOST, VPS_PORT, VPS_USER, VPS_PASSWORD, VPS_DATA_DIR, VPS_KEY_PATH, VPS_KEY_PASSWORD
 except ImportError:
-    VPS_HOST, VPS_PORT, VPS_USER, VPS_PASSWORD, VPS_DATA_DIR = None, 22, None, None, None
+    VPS_HOST, VPS_PORT, VPS_USER, VPS_PASSWORD, VPS_DATA_DIR, VPS_KEY_PATH, VPS_KEY_PASSWORD = None, 22, None, None, None, None, None
 
 class DailyUpdater(BaseApp):
     def __init__(self):
@@ -65,20 +65,33 @@ class DailyUpdater(BaseApp):
         local_sync_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "vps_sync")
         os.makedirs(local_sync_dir, exist_ok=True)
 
-        self.logger.info(f"☁️ [VPS] 正在扫描云端所有缺失的 {data_type} 历史数据...")
+        self.logger.info(f"[VPS] 正在扫描云端所有缺失的 {data_type} 历史数据...")
         synced_data_list = []
         try:
             import paramiko
             ssh = paramiko.SSHClient()
             ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(VPS_HOST, port=VPS_PORT, username=VPS_USER, password=VPS_PASSWORD, timeout=10)
+
+            # 优先使用私钥认证，失败则降级到密码
+            try:
+                if VPS_KEY_PATH and os.path.exists(VPS_KEY_PATH):
+                    pkey = paramiko.Ed25519Key.from_private_key_file(VPS_KEY_PATH, password=VPS_KEY_PASSWORD)
+                    ssh.connect(VPS_HOST, port=VPS_PORT, username=VPS_USER, pkey=pkey, timeout=10)
+                    self.logger.info(f"[VPS] SSH 私钥认证成功")
+                else:
+                    raise Exception("no key file")
+            except Exception as key_err:
+                self.logger.info(f"[VPS] 私钥认证失败 ({key_err})，降级到密码认证")
+                ssh.connect(VPS_HOST, port=VPS_PORT, username=VPS_USER, password=VPS_PASSWORD, timeout=10,
+                            look_for_keys=False, allow_agent=False)
             
             sftp = ssh.open_sftp()
             # 1. 列表远程目录下的所有文件
             try:
                 files = sftp.listdir(VPS_DATA_DIR)
             except IOError:
-                self.logger.warning(f"⚠️ [VPS] 远程目录不存在: {VPS_DATA_DIR}")
+                self.logger.warning(f"[VPS] 远程目录不存在: {VPS_DATA_DIR}")
+                sftp.close(); ssh.close()
                 return []
 
             # 2. 筛选对应类型的文件 (如 woody_2026-05-31.json)
@@ -96,13 +109,12 @@ class DailyUpdater(BaseApp):
                 # [性能优化] 如果数据库已经同步过该日期，且本地已存在该文件，则直接跳过读取，减少内存压力
                 sync_key = f"{data_type}_vps_sync"
                 if os.path.exists(local_path) and self.db.is_access_synced_today(file_date, sync_key):
-                    # self.logger.info(f"   ⏩ [VPS] 日期 {file_date} 已同步，跳过读取。")
                     continue
 
                 # 3. 增量同步：如果本地不存在，则下载
                 if not os.path.exists(local_path):
                     remote_path = f"{VPS_DATA_DIR}/{remote_file}"
-                    self.logger.info(f"📥 [VPS] 正在补全历史数据: {remote_file}")
+                    self.logger.info(f"[VPS] 正在补全历史数据: {remote_file}")
                     sftp.get(remote_path, local_path)
                 
                 # 4. 加载数据 (无论是刚下载的还是本地已有的)
@@ -111,17 +123,17 @@ class DailyUpdater(BaseApp):
                         content = json.load(f)
                     synced_data_list.append({'date': file_date, 'content': content})
                 except Exception as e:
-                    self.logger.error(f"❌ 解析本地同步文件失败 {remote_file}: {e}")
+                    self.logger.error(f"[VPS] 解析本地同步文件失败 {remote_file}: {e}")
 
             sftp.close()
             ssh.close()
             
             if synced_data_list:
-                self.logger.info(f"✅ [VPS] {data_type} 数据同步完成，共获取 {len(synced_data_list)} 天记录")
+                self.logger.info(f"[VPS] {data_type} 数据同步完成，共获取 {len(synced_data_list)} 天记录")
             return synced_data_list
             
         except Exception as e:
-            self.logger.warning(f"⚠️ [VPS] 同步失败: {e}")
+            self.logger.warning(f"[VPS] 同步失败: {e}")
         return []
 
     def _try_fetch_from_vps(self, data_type='woody'):
@@ -712,11 +724,13 @@ class DailyUpdater(BaseApp):
                 try:
                     # 假设文件内容是 {"162411": 12345.67, "161129": 2345.67}
                     count = 0
-                    for fund_code, shares in content.items():
+                    for fund_code_raw, shares in content.items():
                         if shares is not None:
                             # 份额是 T-1 日的（如果是今天早上6点采集，那就是昨天收盘后的数据）
                             # 因此写入历史表时，最好对齐到 file_date 作为基准日
-                            self.db.save_unified_history(date_str=file_date, fund_code=fund_code, shares=shares)
+                            # 去掉 sh/sz 前缀，保持 fund_code 统一的 6 位数字格式
+                            clean_code = fund_code_raw.lower().replace('sh', '').replace('sz', '')
+                            self.db.save_unified_history(date_str=file_date, fund_code=clean_code, shares=shares)
                             count += 1
                     
                     self.logger.info(f"   ✅ [VPS] 同步入库份额数据: {file_date} ({count} 个品种)")
@@ -732,30 +746,53 @@ class DailyUpdater(BaseApp):
         else:
             self.logger.warning("⚠️ [VPS] 未获取到今日场内份额数据 (可能VPS采集失败或今天非交易日)。")
 
-    def run(self):
-        # 按照中国时间，如果是周末，不去爬任何数据，直接完成以保障主看板极速响应
+    def run(self, nav_only=False, refresh_morning=False):
+        today_str = datetime.now().strftime('%Y-%m-%d')
         now = datetime.now()
-        if now.weekday() in (5, 6): # 5: 周六, 6: 周日
-            self.logger.info("📅 [周末免打扰] 今天是周末 (周六/周日)，跳过每日数据大一统更新流水线，以保障主看板极速响应！")
-            self.logger.info("🎉 流水线已跳过，数据大盘一切就绪！")
+
+        if refresh_morning:
+            self.logger.info("🚀 [清晨刷新] 清除9:20前旧标记，重新抓取 Woody/汇率/VPS 上午数据...")
+            if now.weekday() in (5, 6):
+                self.logger.info("📅 周末跳过。")
+                return
+            for src in ['woody_lof_batch', 'official_exchange_rate', 'futures_data', 'jsl_shares_data']:
+                self.logger.info(f"🗑️ 清除 {src} 标记")
+                self.db.remove_access_sync_status(today_str, src)
+            self._run_pipeline()
+            self.logger.info("🎉 [清晨刷新] Woody/汇率/VPS 数据已重新同步！")
             return
 
+        if nav_only:
+            self.logger.info("🚀 [NAV模式] 仅执行净值更新 (step4)...")
+            if now.weekday() in (5, 6):
+                self.logger.info("📅 周末跳过净值更新。")
+                return
+            self.step4_fetch_lof_market()
+            self.logger.info("🎉 [NAV模式] 净值更新完毕！")
+            return
+
+        # 默认：完整流水线
+        if now.weekday() in (5, 6):
+            self.logger.info("📅 [周末免打扰] 跳过每日数据大一统更新流水线。")
+            return
+        self._run_pipeline()
+
+    def _run_pipeline(self):
         self.logger.info("🚀 开始执行每日数据大一统更新流水线...")
         self.step1_and_2_fetch_woody_api()
         self.step2_5_sync_yaml_with_latest_factors()
         self.step3_fetch_exchange_rate()
         self.step4_fetch_lof_market()
         self.step5_fetch_usa_market_data()
-        
-        # 🛡️ 新版 Woody API 已经直接返回了估值日的 `est_price`，
-        # 并已在 WoodyAPIService.process 中入库，因此可以安全跳过原本容易失败的网页爬虫。
-        # 临时注释掉步骤六，观察几天是否平稳。
-        # self.step6_fetch_woody_regional_etfs()
-        
         self.step7_fetch_extra_calibrations()
         self.step8_fetch_sina_futures_from_vps()
         self.step9_fetch_jsl_shares_from_vps()
         self.logger.info("🎉 流水线执行完毕，数据大盘一切就绪！")
 
 if __name__ == "__main__":
-    DailyUpdater().run()
+    import argparse
+    parser = argparse.ArgumentParser(description="ArbNext 日度数据流水线")
+    parser.add_argument("--nav-only", action="store_true", help="仅更新基金净值 (step4)")
+    parser.add_argument("--refresh-morning", action="store_true", help="清除上午标记后重新抓取 Woody/汇率/VPS")
+    args = parser.parse_args()
+    DailyUpdater().run(nav_only=args.nav_only, refresh_morning=args.refresh_morning)

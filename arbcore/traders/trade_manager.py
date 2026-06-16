@@ -12,12 +12,16 @@ if os.path.exists(_lof_dir) and _lof_dir not in sys.path:
 import logging
 logger = logging.getLogger(__name__)
 
-# 导入本地敏感配置
+# 优先尝试从 arbcore.config 导入
 try:
-    from account_private import GJS_ACCOUNT
+    from arbcore.config.account_private import GJS_ACCOUNT
 except ImportError:
-    print("WARNING: account_private.py 不存在，请复制 account_example.py 并填入真实账号")
-    GJS_ACCOUNT = None
+    try:
+        # 兼容旧路径
+        from account_private import GJS_ACCOUNT
+    except ImportError:
+        print("WARNING: account_private.py 不存在，请复制 account_example.py 并填入真实账号")
+        GJS_ACCOUNT = None
 
 class TradeManager:
     """A股/LOF统一交易接口管理器"""
@@ -27,14 +31,14 @@ class TradeManager:
         self.tqconst = None
         self.tdx_account_id = None
         
-        # self.xtquant_available = False  # 国金QMT已注释，用户不使用
-        # self.xt_trader = None
-        # self.xt_account = None
-        # self.xtconstant = None
+        self.xtquant_available = False
+        self.xt_trader = None
+        self.xt_account = None
+        self.xtconstant = None
 
         # 启动时自动初始化可用通道
         self._init_tdx()
-        # self._init_guojin_qmt()  # 国金QMT已注释
+        self._init_guojin_qmt()
 
     def _init_tdx(self):
         try:
@@ -71,65 +75,99 @@ class TradeManager:
         except Exception as e:
             logger.warning(f"[TradeManager] 通达信模块跳过加载: {e}")
 
-    # 【国金QMT已注释】用户不使用
-    # def _init_guojin_qmt(self):
-    #     try:
-    #         # ====================== 国金 QMT 路径与环境配置 ======================
-    #         QMT_INSTALL_PATH = r"D:\GJQMT"
-    #         if os.path.exists(QMT_INSTALL_PATH):
-    #             if QMT_INSTALL_PATH not in sys.path:
-    #                 sys.path.append(QMT_INSTALL_PATH)
-    #                 sys.path.append(os.path.join(QMT_INSTALL_PATH, "lib"))
-    #                 sys.path.append(os.path.join(QMT_INSTALL_PATH, "bin.x64"))
-    #                 sys.path.append(os.path.join(QMT_INSTALL_PATH, "bin.x64", "Lib", "site-packages"))
-    #             
-    #             from xtquant import xttrader, xtconstant
-    #             from xtquant.xttype import StockAccount
-    #             
-    #             qmt_path = os.path.join(QMT_INSTALL_PATH, 'userdata_mini')
-    #             session_id = int(time.time())
-    #             self.xt_trader = xttrader.XtQuantTrader(qmt_path, session_id)
-    #             self.xt_account = StockAccount(GJS_ACCOUNT)
-    #             self.xtconstant = xtconstant
-    #             
-    #             self.xt_trader.start()
-    #             connect_result = self.xt_trader.connect()
-    #             if connect_result == 0:
-    #                 self.xt_trader.subscribe(self.xt_account)
-    #                 self.xtquant_available = True
-    #                 print(f"✅ SUCCESS: [TradeManager] 已挂载【国金MiniQMT】原生直连通道 (账号:{self.xt_account.account_id})")
-    #             else:
-    #                 print(f"WARNING: [TradeManager] 国金QMT客户端连接失败 (错误码: {connect_result})")
-    #     except Exception as e:
-    #         print(f"INFO: [TradeManager] 国金QMT模块跳过加载: {e}")
+    def _init_guojin_qmt(self):
+        try:
+            # ====================== 国金 QMT 路径与环境配置 ======================
+            QMT_INSTALL_PATH = r"D:\GJQMT"
+            if os.path.exists(QMT_INSTALL_PATH):
+                if QMT_INSTALL_PATH not in sys.path:
+                    sys.path.append(QMT_INSTALL_PATH)
+                    sys.path.append(os.path.join(QMT_INSTALL_PATH, "lib"))
+                    sys.path.append(os.path.join(QMT_INSTALL_PATH, "bin.x64"))
+                    sys.path.append(os.path.join(QMT_INSTALL_PATH, "bin.x64", "Lib", "site-packages"))
+                
+                from xtquant import xttrader, xtconstant
+                from xtquant.xttype import StockAccount
+                
+                qmt_path = os.path.join(QMT_INSTALL_PATH, 'userdata_mini')
+                session_id = int(time.time())
+                self.xt_trader = xttrader.XtQuantTrader(qmt_path, session_id)
+                self.xt_account = StockAccount(GJS_ACCOUNT)
+                self.xtconstant = xtconstant
+                
+                self.xt_trader.start()
+                connect_result = self.xt_trader.connect()
+                if connect_result == 0:
+                    self.xt_trader.subscribe(self.xt_account)
+                    self.xtquant_available = True
+                    logger.info(f"[TradeManager] 已挂载【国金MiniQMT】原生直连通道 (账号:{self.xt_account.account_id})")
+                else:
+                    logger.warning(f"[TradeManager] 国金QMT客户端连接失败 (错误码: {connect_result})")
+        except Exception as e:
+            logger.info(f"[TradeManager] 国金QMT模块跳过加载: {e}")
 
     def send_order(self, broker, action, symbol, volume, price, account_id=None):
         """暴露给外部的统一路由函数"""
         if broker == 'yinhe_qmt':
+            # Try-read-OK 模式（v2 - 2026-06-15）
+            # 连接 Test_Yinhe_qmt_ServerV5.py (8888)，主线程队列架构。
+            # 服务端秒回 OK（入队后立即返回），所以发送后尝试读取回执。
+            # 超时或失败时降级为 fire-and-forget（前端不卡死），兼顾可靠性与健壮性。
             try:
                 if account_id:
                     cmd_str = f"{action},{symbol},{volume},{price},{account_id}\n"
                 else:
                     cmd_str = f"{action},{symbol},{volume},{price}\n"
                 client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                client.settimeout(2.0)
+                client.settimeout(3.0)  # 3 秒内连不上就放弃
                 client.connect(('127.0.0.1', 8888))
                 client.sendall(cmd_str.encode('utf-8'))
-                # 只取第一行（订单确认），忽略后续TICK广播数据
-                raw_response = client.recv(4096).decode('utf-8')
-                client.close()
-                first_line = raw_response.split('\n')[0].strip()
-                if first_line == 'OK':
-                    return True, f"银河QMT下单成功"
-                else:
-                    return True, f"银河QMT返回: {first_line}"
+
+                # 尝试读回执（1.5s 超时），读到 OK 可确认识别已送达引擎
+                try:
+                    client.settimeout(1.5)
+                    resp = client.recv(1024).decode('utf-8').strip()
+                    if resp == 'OK':
+                        client.close()
+                        return True, "银河QMT下单成功 (回执确认)"
+                    client.close()
+                    return True, f"银河QMT下单指令已发送 (回执: {resp})"
+                except socket.timeout:
+                    client.close()
+                    return True, "银河QMT下单指令已发送 (fire-and-forget)"
+                except Exception:
+                    client.close()
+                    return True, "银河QMT下单指令已发送"
+
             except ConnectionRefusedError:
-                return False, "银河QMT未开启或 8888 桥接策略未运行"
+                # 端口被占但连接被拒 → 可能全是僵尸线程，建议重启 QMT
+                return False, "银河QMT未开启或 8888 桥接策略未运行（如多次重载策略后出现此错误，请重启QMT）"
             except Exception as e:
                 return False, f"银河QMT下单异常: {str(e)}"
                 
         elif broker == 'guojin_qmt':
-            return False, "国金QMT已禁用"  # 【国金QMT已注释】用户不使用
+            if not self.xtquant_available: return False, "国金QMT接口未就绪"
+            try:
+                # 转换买卖方向
+                order_type = self.xtconstant.STOCK_BUY if action == 'BUY' else self.xtconstant.STOCK_SELL
+                
+                # 调用国金下单接口
+                order_id = self.xt_trader.order_stock(
+                    self.xt_account, 
+                    symbol, 
+                    order_type, 
+                    int(volume), 
+                    self.xtconstant.FIX_PRICE, 
+                    float(price), 
+                    "LOF_Arb", 
+                    "API下单"
+                )
+                if order_id != -1:
+                    return True, f"国金QMT下单成功，委托编号: {order_id}"
+                else:
+                    return False, "国金QMT下单失败（返回编号 -1）"
+            except Exception as e:
+                return False, f"国金QMT下单异常: {e}"
                 
         elif broker == 'tdx':
             if not self.tdx_available: return False, "通达信接口未就绪"
