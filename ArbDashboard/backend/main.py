@@ -1664,6 +1664,7 @@ async def reconnect_engine():
 
 @app.post("/api/system/trigger/{task}")
 async def trigger_task(task: str):
+    logger.info(f"trigger task {task}")
     import subprocess
     # [FIX] 脚本路径计算 - 彻底解耦 LOFarb，指向统一的 arbcore/scripts/daily_updater.py
     scripts_dir = os.path.normpath(os.path.join(backend_dir, "..", "..", "arbcore", "scripts"))
@@ -1678,6 +1679,7 @@ async def trigger_task(task: str):
         return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid task"})
 
     task_entry = task_map[task]
+    logger.info(f"task_entry: {task_entry}")
     if isinstance(task_entry, list):
         script_path = task_entry[0]
         extra_args = task_entry[1:]
@@ -1687,6 +1689,7 @@ async def trigger_task(task: str):
     
     # [V4.1] 尝试多种 Python 路径
     python_exe_candidates = [
+        os.path.normpath(os.path.join(backend_dir, "..", "..", ".venv", "bin", "python")),  # 项目 .venv
         os.path.normpath(os.path.join(backend_dir, "..", "..", ".venv", "Scripts", "python.exe")),  # 项目 .venv
         os.path.normpath(os.path.join(backend_dir, "..", "..", "..", ".venv", "Scripts", "python.exe")),  # 上级 .venv
         os.path.normpath(os.path.join(backend_dir, "..", "..", "..", "Python311", "python.exe")),  # Python311
