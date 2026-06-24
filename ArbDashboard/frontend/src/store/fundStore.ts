@@ -37,13 +37,17 @@ export interface FundItem {
   [key: string]: any
 }
 
-/** TAB 分类映射（与后端 fund_service.py 保持一致） */
+/**
+ * TAB 分类映射（与 unified_fund_list.category 字段保持一致）
+ * 每个值对应数据库中真实存在的 category，无历史遗留空壳条目。
+ * DB 已有的 category: 黄金原油 | QDII欧美 | 混合跨境 | QDII亚洲 | 国内指数 | 指数LOF | 白银 | 债券/货币
+ */
 export const TAB_CATEGORIES: Record<string, string[]> = {
-  '黄金原油': ['黄金原油', '黄金', '原油'],
-  'QDII欧美': ['纯ETF', 'QDII 欧美', '混合跨境', 'QDII欧美'],
-  'QDII亚洲': ['QDII 亚洲', 'QDII亚洲'],
-  '国内LOF': ['指数LOF', '其他', '国内LOF', 'lof_domestic'],
-  '白银': ['白银', '白银LOF'],
+  '黄金原油': ['黄金原油'],
+  'QDII欧美': ['QDII欧美', '混合跨境'],
+  'QDII亚洲': ['QDII亚洲'],
+  '国内LOF': ['国内指数', '指数LOF'],
+  '白银': ['白银'],
   '现金管理': ['债券/货币']
 }
 
@@ -53,9 +57,17 @@ export const useFundStore = defineStore('fund', () => {
   // ---- state ----
   const tableData = ref<FundItem[]>([])
   const loading = ref(false)
-  // 从 localStorage 恢复上次 TAB，默认"自选"
-  const savedTab = typeof localStorage !== 'undefined' ? localStorage.getItem('dashboard_tab') : null
-  const currentTab = ref(savedTab || '自选')
+  const dashboardMeta = ref({
+    updated_at: null as string | null,
+    stale: false,
+    compute_ms: 0,
+    error: null as string | null
+  })
+  let dashboardInFlight = false
+  let dashboardController: AbortController | null = null
+  let dashboardRequestSeq = 0
+  // 始终默认"我的自选"TAB（用户从其他页面回来时永远看到自选）
+  const currentTab = ref('自选')
   const searchKeyword = ref('')
   const fundHistory = ref<any[]>([])
   const fundHistoryLoading = ref(false)
@@ -63,12 +75,13 @@ export const useFundStore = defineStore('fund', () => {
   const basketData = ref<any[]>([])
 
   // ---- watchlist（持久化到 localStorage） ----
+  const DEFAULT_WATCHLIST = ['162411']
   const savedWatchlist = (() => {
     try {
-      const w = JSON.parse(localStorage.getItem('watchlist') || '[]')
-      return Array.isArray(w) ? w : []
+      const w = JSON.parse(localStorage.getItem('watchlist') || 'null')
+      return Array.isArray(w) && w.length > 0 ? w : DEFAULT_WATCHLIST
     } catch {
-      return []
+      return DEFAULT_WATCHLIST
     }
   })()
   const watchlist = ref<string[]>(savedWatchlist)
@@ -116,7 +129,12 @@ export const useFundStore = defineStore('fund', () => {
     return watchlist.value.includes(code)
   }
 
-  async function fetchDashboard(isSilent = false) {
+  async function fetchDashboard(isSilent = false, cancelPrevious = false) {
+    if (dashboardInFlight && !cancelPrevious) return
+    if (cancelPrevious && dashboardController) dashboardController.abort()
+    dashboardInFlight = true
+    dashboardController = new AbortController()
+    const requestSeq = ++dashboardRequestSeq
     if (!isSilent && tableData.value.length === 0) loading.value = true
     try {
       const params: Record<string, string> = {}
@@ -125,13 +143,22 @@ export const useFundStore = defineStore('fund', () => {
       } else {
         params.category = currentTab.value
       }
-      const res = await api.getDashboard(params)
-      if (res.data?.status === 'ok') {
+      const res = await api.getDashboard(params, dashboardController.signal)
+      if (requestSeq === dashboardRequestSeq && res.data?.status === 'ok') {
         tableData.value = res.data.data || []
+        dashboardMeta.value = {
+          updated_at: res.data.updated_at || null,
+          stale: !!res.data.stale,
+          compute_ms: Number(res.data.compute_ms || 0),
+          error: res.data.error || null
+        }
       }
-    } catch (err) {
-      console.error('获取看板数据失败', err)
+    } catch (err: any) {
+      if (err?.name !== 'CanceledError' && err?.code !== 'ERR_CANCELED') {
+        console.error('获取看板数据失败', err)
+      }
     } finally {
+      dashboardInFlight = false
       loading.value = false
     }
   }
@@ -185,6 +212,7 @@ export const useFundStore = defineStore('fund', () => {
 
   return {
     tableData, loading, currentTab, searchKeyword,
+    dashboardMeta,
     fundHistory, fundHistoryLoading,
     intradayData, basketData,
     watchlist,

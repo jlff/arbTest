@@ -63,7 +63,8 @@ class DailyUpdater(BaseApp):
         if not all([VPS_HOST, VPS_USER, VPS_PASSWORD]):
             return []
         
-        local_sync_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "vps_sync")
+        # 数据目录迁移到 ArbDashboard/data/（与脚本目录解耦）
+        local_sync_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ArbDashboard", "data", "vps_sync"))
         os.makedirs(local_sync_dir, exist_ok=True)
 
         self.logger.info(f"[VPS] 正在扫描云端所有缺失的 {data_type} 历史数据...")
@@ -149,7 +150,7 @@ class DailyUpdater(BaseApp):
     def step1_and_2_fetch_woody_api(self):
         """
         步骤一 & 二：获取 Woody 数据并解析入库
-        实施“安全第一”防御机制：VPS(增量追溯) -> API -> Crawler -> Stop on Failure
+        实施"安全第一"防御机制：VPS(增量追溯) -> API -> Crawler -> Stop on Failure
         """
         self.logger.info("=== 步骤一：获取 Woody 数据，步骤二：解析入库 (增量追溯模式) ===")
         today_str = datetime.now().strftime('%Y-%m-%d')
@@ -160,8 +161,25 @@ class DailyUpdater(BaseApp):
             self.logger.info(f"✅ 今日 Woody 因子已处理完毕（防刷标记 {sync_key} 已存在），跳过 VPS 同步与 API 请求。")
             return True
 
+        # 🛡️ 数据库检查：如果库里已有今天的 Woody 因子数据，无需连 VPS
+        try:
+            conn = self.db._get_conn()
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM raw_api_data WHERE date = ? AND source = 'woody_lof'",
+                (today_str,)
+            )
+            count = cursor.fetchone()[0]
+            conn.close()
+            if count > 0:
+                self.logger.info(f"✅ 今日({today_str}) Woody 原始数据已在库中({count}条)，无需连VPS，直接标记完成。")
+                self.db.mark_access_synced(today_str, sync_key)
+                return True
+        except Exception as e:
+            self.logger.warning(f"检查 Woody 数据库时出错: {e}，继续连接VPS获取")
+
         codes = [str(fund.get('code', '')) for fund in self.config.get('funds', []) if str(fund.get('code', '')) != '161226']
-        backup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "woodyAPI")
+        # 数据目录迁移到 ArbDashboard/data/（与脚本目录解耦）
+        backup_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "ArbDashboard", "data", "woodyAPI"))
         
         # Level 0: VPS Siphon (支持多日历史自动补全)
         vps_history_data = self._try_sync_all_from_vps('woody')
@@ -328,6 +346,22 @@ class DailyUpdater(BaseApp):
         self.logger.info("=== 步骤三：抓取汇率（人民币中间价） ===")
         today_str = datetime.now().strftime('%Y-%m-%d')
 
+        # 🛡️ 数据库检查：如果库里已有今天的汇率数据，无需连 VPS
+        try:
+            conn = self.db._get_conn()
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM exchange_rate WHERE date = ? AND usd_cny_mid IS NOT NULL",
+                (today_str,)
+            )
+            count = cursor.fetchone()[0]
+            conn.close()
+            if count > 0:
+                self.logger.info(f"✅ 今日({today_str})汇率已在库中，无需连VPS，直接跳过。")
+                self.db.mark_access_synced(today_str, source='official_exchange_rate')
+                return
+        except Exception as e:
+            self.logger.warning(f"检查汇率数据库时出错: {e}，继续连接VPS获取")
+
         # Level 0: 尝试从 VPS 增量同步汇率数据并入库
         vps_fx_data = self._try_sync_all_from_vps('fx')
         if vps_fx_data:
@@ -418,21 +452,42 @@ class DailyUpdater(BaseApp):
         today_str = datetime.now().strftime('%Y-%m-%d')
         current_hour = datetime.now().hour
 
-        for fund in self.config.get('funds', []):
-            code = str(fund.get('code', ''))
+        # 从大一统基金列表获取所有基金代码（覆盖 QDII亚洲/国内LOF/债券货币等 lof_config.yaml 未收录的品种）
+        conn_ufl = self.db._get_conn()
+        all_fund_rows = conn_ufl.execute("SELECT fund_code FROM unified_fund_list").fetchall()
+        conn_ufl.close()
+        all_codes = [str(r[0]) for r in all_fund_rows if r[0]]
+        self.logger.info(f"📋 unified_fund_list 共 {len(all_codes)} 只基金，开始遍历净值/价格同步...")
+
+        for code in all_codes:
             if not code: continue
                 
-            # --- 1. 获取收盘价 (Sina) ---
+            # --- 1. 获取收盘价和成交额 (新浪实时行情接口) ---
             if not self.db.is_access_synced_today(today_str, source=f'lof_price_{code}'):
-                price_df = self.hist_manager.get_prices(code, source="sina")
-                if not price_df.empty:
-                    for _, row in price_df.iterrows():
-                        d_str = row['date'].strftime('%Y-%m-%d')
-                        self._safe_save_fund_data(date_str=d_str, fund_code=code, price=row['close'])
-                        # 记录更多指标到大一统表
-                        self.db.save_unified_history(date_str=d_str, fund_code=code, volume=row.get('volume'), turnover_rate=row.get('turnover_rate'))
-                    self.db.mark_access_synced(today_str, source=f'lof_price_{code}')
-                    self.logger.info(f"✅ [{code}] 历史价格同步完成")
+                # 新浪实时行情接口获取成交额
+                import requests
+                sina_code = f"sz{code}" if code.startswith(('0', '1', '3')) else f"sh{code}"
+                url = f"https://hq.sinajs.cn/list={sina_code}"
+                headers = {
+                    "Referer": "https://finance.sina.com.cn/",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+                try:
+                    resp = requests.get(url, headers=headers, timeout=10)
+                    resp.encoding = "gbk"
+                    if resp.status_code == 200 and 'FAILED' not in resp.text and '=""' not in resp.text:
+                        data_part = resp.text.split('="')[1].split('";')[0]
+                        fields = data_part.split(",")
+                        if len(fields) > 9:
+                            price = float(fields[3])  # 开盘价
+                            amount_yuan = float(fields[9])  # 成交额(元)
+                            amount_wan = round(amount_yuan / 10000, 2)  # 成交额(万元)，保留2位小数
+                            self._safe_save_fund_data(date_str=today_str, fund_code=code, price=price)
+                            self.db.save_unified_history(date_str=today_str, fund_code=code, volume=amount_wan)
+                            self.db.mark_access_synced(today_str, source=f'lof_price_{code}')
+                            self.logger.info(f"✅ [{code}] 历史价格同步完成: 价格={price}, 成交额={amount_wan}万元")
+                except Exception as e:
+                    self.logger.error(f"❌ [{code}] 新浪接口获取失败: {e}")
 
             # --- 2. 获取东财净值 ---
             def get_prev_trading_day(dt):
@@ -480,13 +535,20 @@ class DailyUpdater(BaseApp):
         self.logger.info("=== 步骤五：抓取海外及指数市场交易数据 (标准库模式) ===")
         today_str = datetime.now().strftime('%Y-%m-%d')
         start_date = (datetime.now() - timedelta(days=15)).strftime('%Y-%m-%d')
-        
+
+        # access_sync_status 防刷：今天已跑过步骤五就跳过
+        if self.db.is_access_synced_today(today_str, source='usa_etf_data'):
+            self.logger.info("⏭️ [海外/指数] 今日已抓取，跳过步骤五")
+            return
+
         symbols = set()
         for fund in self.config.get('funds', []):
             for item in fund.get('valuation_portfolio', []) + fund.get('hedging_portfolio', []):
                 sym = str(item.get('symbol', '')).replace('^', '').split('-')[0]
-                if sym and not sym.isdigit(): symbols.add(sym)
-                
+                # 港股代码(5位纯数字如00700)允许通过，其他纯数字跳过
+                if sym and (not sym.isdigit() or len(sym) == 5):
+                    symbols.add(sym)
+
         for sym in symbols:
             df = self.hist_manager.get_prices(sym, source="sina", start_date=start_date)
             if not df.empty:
@@ -494,12 +556,14 @@ class DailyUpdater(BaseApp):
                     date_str = row['date'].strftime('%Y-%m-%d')
                     self.db.upsert_usa_etf_price(date=date_str, symbol=sym, price=row['close'])
                     # 同步更新大一统表中的指数价格
-                    # 查找哪些基金使用了这个 sym 作为指数
                     for fund in self.config.get('funds', []):
                         for item in fund.get('valuation_portfolio', []) + fund.get('hedging_portfolio', []):
                             if sym in str(item.get('symbol', '')):
                                 self.db.save_unified_history(date_str=date_str, fund_code=fund['code'], index_close=row['close'])
                 self.logger.info(f"✅ [海外/指数] {sym} 行情同步完成")
+
+        self.db.mark_access_synced(today_str, source='usa_etf_data')
+        self.logger.info(f"✅ [海外/指数] 步骤五完成，已标记防刷")
 
     def step6_fetch_woody_regional_etfs(self):
         """步骤六：抓取 Woody 特有的区域变种虚拟 ETF (如 ^GLD-EU) 历史行情"""
@@ -705,47 +769,48 @@ class DailyUpdater(BaseApp):
             self.logger.error("❌ [本地兜底] 获取期货数据失败。")
 
     def step9_fetch_jsl_shares_from_vps(self):
-        """步骤九：从VPS同步深交所场内份额数据"""
-        self.logger.info("=== 步骤九：从VPS同步深交所场内份额数据 ===")
+        """步骤九：从VPS同步场内份额数据（含深交所+上交所）"""
+        self.logger.info("=== 步骤九：从VPS同步场内份额数据 ===")
         today_str = datetime.now().strftime('%Y-%m-%d')
-        
-        # 份额通常是 T-1 日的数据，但它是每天采集的，所以标记为当天已同步
+
+        # [V10.4] 防刷检查：今日已同步过则跳过，避免每次启动重复拉取 VPS
         if self.db.is_access_synced_today(today_str, source='jsl_shares_data'):
-            self.logger.info("✅ 今日已同步过场内份额数据，跳过。")
+            self.logger.info("✅ 今日份额数据已同步，跳过 VPS 拉取")
             return
-            
+
         vps_shares_data = self._try_sync_all_from_vps('shares')
-        vps_today_success = False
+        processed_count = 0
+        skipped_count = 0
         
         if vps_shares_data:
-            self.logger.info(f"🔄 [VPS] 发现 {len(vps_shares_data)} 份历史份额数据，正在同步入库...")
+            self.logger.info(f"🔄 [VPS] 发现 {len(vps_shares_data)} 份份额数据文件，正在逐日检查...")
             for item in vps_shares_data:
                 file_date = item['date']
                 content = item['content']
+                
+                # 总是处理每个文件（save_unified_history 使用 UPSERT，安全幂等）
+                # 即使 DB 已有部分数据，VPS 文件可能包含更多基金（如扩展 symbols 后）
                 try:
-                    # 假设文件内容是 {"162411": 12345.67, "161129": 2345.67}
                     count = 0
                     for fund_code_raw, shares in content.items():
                         if shares is not None:
-                            # 份额是 T-1 日的（如果是今天早上6点采集，那就是昨天收盘后的数据）
-                            # 因此写入历史表时，最好对齐到 file_date 作为基准日
                             # 去掉 sh/sz 前缀，保持 fund_code 统一的 6 位数字格式
                             clean_code = fund_code_raw.lower().replace('sh', '').replace('sz', '')
                             self.db.save_unified_history(date_str=file_date, fund_code=clean_code, shares=shares)
                             count += 1
                     
-                    self.logger.info(f"   ✅ [VPS] 同步入库份额数据: {file_date} ({count} 个品种)")
-                    self.db.mark_access_synced(file_date, 'shares_vps_sync')
-                    if file_date >= today_str:
-                        vps_today_success = True
+                    self.logger.info(f"   ✅ [VPS] 入库份额数据: {file_date} ({count} 个品种)")
+                    processed_count += 1
                 except Exception as e:
                     self.logger.error(f"   ❌ [VPS] 解析日期 {file_date} 份额数据时出错: {e}")
 
-        if vps_today_success:
-            self.db.mark_access_synced(today_str, source='jsl_shares_data')
-            self.logger.info("✅ [VPS] 今日场内份额数据同步完成！")
+            self.logger.info(f"✅ [VPS] 份额同步完成: 处理 {processed_count} 天, 跳过 {skipped_count} 天")
+            
+            # 标记今日已同步（防止其他入口重复触发）
+            if any(item['date'] >= today_str for item in vps_shares_data):
+                self.db.mark_access_synced(today_str, source='jsl_shares_data')
         else:
-            self.logger.warning("⚠️ [VPS] 未获取到今日场内份额数据 (可能VPS采集失败或今天非交易日)。")
+            self.logger.warning("⚠️ [VPS] 未获取到份额数据 (可能VPS采集失败或网络问题)")
 
     def _step10_calculate_static_valuation(self):
         """步骤十：基于同步后的因子数据，计算所有基金的静态估值 (static_val)"""
@@ -767,6 +832,220 @@ class DailyUpdater(BaseApp):
             except Exception as e:
                 self.logger.error(f"  ❌ [{fund.get('code')}] 静态估值计算失败: {e}")
         self.logger.info(f"✅ [静态估值] 计算完成，{success}/{len(config.get('funds', []))} 只基金已更新")
+
+    # ================================================================
+    # 步骤十一：跟踪指数公式静态估值 (覆盖 QDII亚洲 / 国内LOF / 指数LOF)
+    # 公式: static_val = prev_nav * (1 + pos_ratio * (idx_ratio * fx_ratio - 1))
+    # 与魔法公式区别：用指数比率代替 ETF 价格/hedge，无需 hedge 参数
+    # ================================================================
+    def step11_simple_static_valuation(self):
+        """
+        跟踪指数公式静态估值：覆盖 step10 未处理的基金
+        公式: static_val = prev_nav * (1 + pos_ratio * (idx_ratio * fx_ratio - 1))
+        与魔法公式区别：用指数比率代替 ETF 价格/hedge，无需 hedge 参数
+        """
+        import sqlite3
+        self.logger.info("=== 步骤十一：跟踪指数公式静态估值 (QDII亚洲/国内LOF/指数LOF) ===")
+
+        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "database", "arb_master.db")
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("PRAGMA busy_timeout = 30000")
+        cursor = conn.cursor()
+
+        # 1. 获取所有基金
+        cursor.execute("SELECT fund_code, category, related_index, pos_ratio FROM unified_fund_list")
+        all_funds = cursor.fetchall()
+
+        # 2. 分类：step10 已处理黄金原油和有basket的基金，这里处理其余
+        #    - 国内指数/指数LOF → A股，无汇率
+        #    - QDII亚洲 → 港币
+        #    - QDII欧美（无basket的，如标普500）→ 美元
+        #    - 白银 → 跳过（期货估值特殊）
+        a_share = []
+        hk_funds = []
+        us_funds = []
+
+        # 读取 fund_list.csv 获取分类（与 jsl/03_eod_all.py 一致）
+        csv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), "jsl", "fund_list.csv")
+        fund_category = {}
+        if os.path.exists(csv_path):
+            with open(csv_path, 'r', encoding='utf-8-sig') as f:
+                import csv
+                reader = csv.DictReader(f)
+                for row in reader:
+                    code = row.get('代码', '').strip()
+                    cat = row.get('分类', '').strip()
+                    if code and cat:
+                        fund_category[code] = cat
+
+        hk_index_syms = {'HSI', 'HSCEI', 'HSCCI', 'HSMCI', 'HSTECH', 'HSCI', 'HSSI', 'HSSNCNE', 'HSMI'}
+
+        for fund_code, category, related_index, pos_ratio in all_funds:
+            if category == '白银':
+                continue  # 白银跳过
+
+            ri = str(related_index).strip() if related_index else ''
+            if not ri or ri == '-' or ri == '0':
+                continue  # 无跟踪标的，跳过
+
+            ri_upper = ri.upper()
+            ri_lower = ri.lower()
+
+            # 按 category 分类
+            if category in ('国内指数', '指数LOF'):
+                a_share.append((fund_code, ri, pos_ratio or 0.95))
+            elif category == 'QDII亚洲':
+                hk_funds.append((fund_code, ri, pos_ratio or 0.95))
+            elif category == 'QDII欧美':
+                us_funds.append((fund_code, ri, pos_ratio or 0.95))
+            elif category in ('黄金原油', '混合跨境'):
+                continue  # step10 已处理
+            else:
+                # 根据指数代码推断
+                if ri_upper in hk_index_syms or ri_lower in {s.lower() for s in hk_index_syms}:
+                    hk_funds.append((fund_code, ri, pos_ratio or 0.95))
+                elif ri_lower.startswith('399') or ri_lower.startswith('000') or ri_lower.startswith('001') or '.csi' in ri_lower:
+                    a_share.append((fund_code, ri, pos_ratio or 0.95))
+                elif ri_upper in ('.INX', '.NDX', 'SPY', 'QQQ', 'XOP', 'XLY', 'XBI', 'KWEB', 'RSPH', 'INDA'):
+                    us_funds.append((fund_code, ri, pos_ratio or 0.95))
+
+        self.logger.info(f"  分类结果: A股={len(a_share)}, 港股={len(hk_funds)}, 美股={len(us_funds)}")
+
+        total_updated = 0
+
+        def process_batch(funds, batch_name, fx_type='none'):
+            nonlocal total_updated
+            if not funds:
+                return
+            self.logger.info(f"  --- {batch_name} ({len(funds)} 只) ---")
+
+            for fund_code, related_index, pos_ratio in funds:
+                # 获取指数历史数据
+                cursor.execute(
+                    "SELECT date, close FROM index_history WHERE symbol = ? ORDER BY date",
+                    (related_index.upper(),))
+                idx_rows = cursor.fetchall()
+                if not idx_rows:
+                    # 尝试小写
+                    cursor.execute(
+                        "SELECT date, close FROM index_history WHERE symbol = ? ORDER BY date",
+                        (related_index.lower(),))
+                    idx_rows = cursor.fetchall()
+                if not idx_rows:
+                    self.logger.warning(f"    [{fund_code}] 指数 {related_index} 无历史数据，跳过")
+                    continue
+
+                idx_data = {r[0]: r[1] for r in idx_rows}
+
+                # 获取该基金的交易日数据
+                cursor.execute(
+                    "SELECT date, nav, price, index_close FROM unified_fund_history "
+                    "WHERE fund_code = ? AND nav IS NOT NULL ORDER BY date",
+                    (fund_code,))
+                fund_rows = cursor.fetchall()
+
+                count = 0
+                last_fx_pct = 0
+
+                for date, nav, price, existing_idx_close in fund_rows:
+                    if not nav or float(nav) <= 0:
+                        continue
+
+                    # 回写 index_close（如果缺失）
+                    if date in idx_data:
+                        current_idx_close = idx_data[date]
+                        if existing_idx_close is None:
+                            cursor.execute(
+                                "UPDATE unified_fund_history SET index_close = ? "
+                                "WHERE fund_code = ? AND date = ?",
+                                (current_idx_close, fund_code, date))
+                    else:
+                        current_idx_close = existing_idx_close
+
+                    if current_idx_close is None:
+                        continue
+
+                    # 找基准日：前一个有 nav 和 index_close 的交易日
+                    cursor.execute(
+                        "SELECT date, nav, index_close FROM unified_fund_history "
+                        "WHERE fund_code = ? AND date < ? AND nav IS NOT NULL "
+                        "ORDER BY date DESC LIMIT 1",
+                        (fund_code, date))
+                    prev_row = cursor.fetchone()
+                    if not prev_row:
+                        continue
+
+                    prev_date, prev_nav, prev_idx_close = prev_row
+                    if not prev_nav or float(prev_nav) <= 0 or not prev_idx_close or float(prev_idx_close) <= 0:
+                        continue
+
+                    # 汇率比率
+                    fx_ratio = 1.0
+                    if fx_type != 'none':
+                        if fx_type == 'usd':
+                            cursor.execute("SELECT usd_cny_mid FROM exchange_rate WHERE date = ?", (date,))
+                            curr_fx = cursor.fetchone()
+                            cursor.execute("SELECT usd_cny_mid FROM exchange_rate WHERE date = ?", (prev_date,))
+                            prev_fx = cursor.fetchone()
+                        else:  # hkd
+                            cursor.execute("SELECT hkd_cny_mid FROM exchange_rate WHERE date = ?", (date,))
+                            curr_fx = cursor.fetchone()
+                            cursor.execute("SELECT hkd_cny_mid FROM exchange_rate WHERE date = ?", (prev_date,))
+                            prev_fx = cursor.fetchone()
+
+                        curr_val = curr_fx[0] if curr_fx and curr_fx[0] else None
+                        prev_val = prev_fx[0] if prev_fx and prev_fx[0] else None
+                        if curr_val and prev_val and prev_val > 0:
+                            fx_ratio = curr_val / prev_val
+                        else:
+                            continue
+
+                    # 指数比率
+                    idx_ratio = float(current_idx_close) / float(prev_idx_close)
+
+                    # 静态估值
+                    static_val = float(prev_nav) * (1 + pos_ratio * (idx_ratio * fx_ratio - 1))
+
+                    # 溢价率 (用收盘价)
+                    premium = None
+                    if price and float(price) > 0:
+                        premium = (float(price) / float(nav) - 1) * 100
+
+                    # 估值误差
+                    calibration = (static_val / float(nav) - 1) * 100 if float(nav) > 0 else None
+
+                    # 指数涨幅
+                    index_pct = (idx_ratio - 1) * 100
+
+                    # 溢价率误差（估算溢价 - 实际溢价）
+                    rt_premium = None
+                    if price and float(price) > 0 and static_val > 0:
+                        est_premium = (float(price) / static_val - 1) * 100
+                        if premium is not None:
+                            rt_premium = est_premium - premium
+
+                    cursor.execute(
+                        "UPDATE unified_fund_history SET static_val=?, premium=?, "
+                        "index_pct=?, calibration=?, rt_premium=? "
+                        "WHERE fund_code=? AND date=?",
+                        (static_val, premium, index_pct, calibration, rt_premium,
+                         fund_code, date))
+                    if cursor.rowcount > 0:
+                        count += 1
+
+                total_updated += count
+                if count > 0:
+                    self.logger.info(f"    [{fund_code}] 更新 {count} 条")
+
+        process_batch(a_share, "A股指数/LOF (无汇率)", fx_type='none')
+        process_batch(hk_funds, "QDII亚洲 (港币)", fx_type='hkd')
+        process_batch(us_funds, "QDII欧美 (美元)", fx_type='usd')
+
+        conn.commit()
+        conn.close()
+        self.logger.info(f"✅ [简单估值] 完成，共更新 {total_updated} 条记录")
 
     def run(self, nav_only=False, refresh_morning=False):
         today_str = datetime.now().strftime('%Y-%m-%d')
@@ -810,12 +1089,58 @@ class DailyUpdater(BaseApp):
         self.step8_fetch_sina_futures_from_vps()
         self.step9_fetch_jsl_shares_from_vps()
         self._step10_calculate_static_valuation()
+        self.step11_simple_static_valuation()
         self.logger.info("🎉 流水线执行完毕，数据大盘一切就绪！")
 
 if __name__ == "__main__":
     import argparse
+    import subprocess
+
     parser = argparse.ArgumentParser(description="ArbNext 日度数据流水线")
     parser.add_argument("--nav-only", action="store_true", help="仅更新基金净值 (step4)")
     parser.add_argument("--refresh-morning", action="store_true", help="清除上午标记后重新抓取 Woody/汇率/VPS")
     args = parser.parse_args()
-    DailyUpdater().run(nav_only=args.nav_only, refresh_morning=args.refresh_morning)
+
+    # 进程互斥锁（跨平台）：用 PID 文件防多实例
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_updater.lock")
+
+    def _is_pid_alive(pid):
+        try:
+            if os.name == 'nt':
+                result = subprocess.run(['tasklist', '/FI', f'PID eq {pid}'], capture_output=True, text=True, timeout=5)
+                return str(pid) in result.stdout
+            else:
+                os.kill(pid, 0)
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    locked = False
+    try:
+        with open(lock_path, 'x') as f:
+            f.write(str(os.getpid()))
+        locked = True
+    except FileExistsError:
+        try:
+            with open(lock_path, 'r') as f:
+                old_pid = int(f.read().strip())
+            if _is_pid_alive(old_pid):
+                print(f"[SKIP] 另一个 daily_updater 实例正在运行 (PID {old_pid})，退出。")
+                sys.exit(0)
+            # 旧进程已死，抢锁
+            with open(lock_path, 'w') as f:
+                f.write(str(os.getpid()))
+            locked = True
+        except (ValueError, FileNotFoundError):
+            with open(lock_path, 'w') as f:
+                f.write(str(os.getpid()))
+            locked = True
+
+    try:
+        DailyUpdater().run(nav_only=args.nav_only, refresh_morning=args.refresh_morning)
+    finally:
+        if locked:
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass

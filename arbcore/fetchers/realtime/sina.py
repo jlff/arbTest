@@ -24,7 +24,7 @@ class SinaRealtimeFetcher(BaseRealtimeFetcher):
         self.quotes = {}
         self.running = False
         self._thread = None
-        self.interval = 5.0  # 默认 5 秒轮询一次
+        self.interval = 30.0  # [V10.1] 30秒轮询一次，避免新浪反爬封禁
 
     def connect(self) -> bool:
         # 新浪 API 不需要维持长连接
@@ -77,8 +77,8 @@ class SinaRealtimeFetcher(BaseRealtimeFetcher):
         for line in lines:
             # A股匹配: hq_str_sh600000="..."
             match_a = re.search(r'hq_str_([a-z]{2})(\d{6})="([^"]+)"', line)
-            # 港股匹配: hq_str_rt_hk00700="..."
-            match_hk = re.search(r'hq_str_rt_hk(\d{5})="([^"]+)"', line)
+            # 港股匹配: hq_str_rt_hk00700="..." 或 hq_str_rt_hkHSI="..."
+            match_hk = re.search(r'hq_str_rt_hk([A-Z0-9]{2,5})="([^"]+)"', line)
             
             if match_a:
                 code = match_a.group(2)

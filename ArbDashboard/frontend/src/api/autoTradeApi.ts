@@ -42,3 +42,29 @@ export function toggleAutoTradeEngine(action: 'start' | 'stop') {
 export function getAutoTradeLogs() {
   return client.get('/api/auto_trade/logs')
 }
+
+/**
+ * SignalDetector API
+ */
+
+/** 获取 SignalDetector 状态 */
+export function getSignalDetectorStatus() {
+  return client.get('/api/signal_detector/status')
+}
+
+/** 启动/停止 SignalDetector */
+export function toggleSignalDetector(action: 'start' | 'stop') {
+  return client.post('/api/signal_detector/toggle', { action })
+}
+
+/** 获取 SignalDetector 日志 */
+export function getSignalDetectorLogs() {
+  return client.get('/api/signal_detector/logs')
+}
+
+/** @deprecated 使用 getSignalDetectorStatus */
+export const getExecutorStatus = getSignalDetectorStatus
+/** @deprecated 使用 toggleSignalDetector */
+export const toggleExecutor = toggleSignalDetector
+/** @deprecated 使用 getSignalDetectorLogs */
+export const getExecutorLogs = getSignalDetectorLogs

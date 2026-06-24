@@ -1,60 +1,33 @@
 <template>
   <div class="analysis-page">
-    <!-- 1. 雷达模式：当没有选择基金时显示机会榜单 -->
-    <div v-if="!fundCode || fundCode === 'radar'" class="radar-mode animate-fade-in">
-      <n-card :bordered="false" class="shadow-soft">
-        <template #header>
-          <!-- 标题行 -->
-          <div class="flex-center gap-2" style="margin-bottom: 12px;">
-            <n-icon size="24" color="#2563eb"><Zap /></n-icon>
-            <span class="text-xl font-bold">全场套利机会实时雷达</span>
-          </div>
-          <!-- 筛选控件行 -->
-          <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
-            <!-- 左侧：Tab筛选 -->
-            <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
-              <!-- 我的自选Tab -->
-              <n-checkbox v-model:checked="showWatchlistOnly" size="small" label-style="font-weight: bold; color: #f59e0b; font-size: 14px;">
-                ★ 我的自选
-              </n-checkbox>
-              <n-divider vertical />
-              <!-- 分类筛选 -->
-              <n-checkbox-group v-model:value="selectedCategories">
-                <n-checkbox value="gold_oil" label="黄金原油" label-style="font-weight: bold; color: #333;" />
-                <n-checkbox value="qdii_us" label="QDII欧美" label-style="font-weight: bold; color: #333;" />
-                <n-checkbox value="qdii_asia" label="QDII亚洲" label-style="font-weight: bold; color: #333;" />
-                <n-checkbox value="domestic_lof" label="国内LOF" label-style="font-weight: bold; color: #333;" />
-                <n-checkbox value="silver" label="白银" label-style="font-weight: bold; color: #333;" />
-              </n-checkbox-group>
-            </div>
-            <!-- 右侧：折价率阈值 -->
-            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-              <span style="font-size: 12px; color: #666;">折价率:</span>
-              <n-input-number v-model:value="premiumThreshold" :min="-10" :max="10" :step="0.1" style="width: 100px;" size="small" /> %
-              <span style="font-size: 12px; color: #666;">~</span>
-              <n-input-number v-model:value="premiumUpperThreshold" :min="-10" :max="10" :step="0.1" style="width: 100px;" size="small" /> %
-              <n-tag type="success" ghost>触发: {{ premiumThreshold }}% ~ {{ premiumUpperThreshold }}%</n-tag>
-            </div>
-          </div>
-        </template>
-        
-        <n-data-table
-          :columns="radarColumns"
-          :data="opportunityData"
-          size="small"
-          bordered
-          :pagination="{ pageSize: 10 }"
-          class="radar-table"
-        />
-      </n-card>
-    </div>
-
-    <!-- 2. 详情模式：专业狙击工作站 -->
-    <div v-else class="detail-mode animate-fade-in">
-      <!-- 顶部专业摘要栏 (标题 + 基础仓位) -->
+    <!-- 详情模式：专业狙击工作站 -->
+    <div class="detail-mode animate-fade-in">
+      <!-- 顶部专业摘要栏 (标题 + 基础仓位 + 基金选择器) -->
       <div class="fund-summary-header shadow-soft" style="background: #fff; padding: 12px 20px; border-radius: 12px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 2px solid #ffcc80;">
          <div class="header-left" style="display: flex; align-items: center; gap: 16px;">
             <n-button quaternary circle @click="handleBack"><template #icon><n-icon><ArrowLeft /></n-icon></template></n-button>
+            <!-- [V10.10] 基金选择器：手动输入代码或从预设下拉选择 -->
+            <div style="display: flex; align-items: center; gap: 8px;">
+               <span style="font-size: 13px; color: #64748b;">基金代码:</span>
+               <n-select
+                  :value="selectedFundCode"
+                  :options="fundDropdownOptions"
+                  @update:value="onFundSelected"
+                  style="width: 160px;"
+                  size="small"
+                  placeholder="选择或输入代码"
+                  filterable
+                  clearable
+               />
+               <n-input
+                  v-model:value="manualFundCode"
+                  placeholder="手动输入代码"
+                  size="small"
+                  style="width: 120px;"
+                  @keyup.enter="onManualFundEnter"
+               />
+               <n-button size="tiny" type="primary" @click="onManualFundSubmit">加载</n-button>
+            </div>
             <div class="fund-info">
                <div style="font-size:18px; font-weight:bold; color: #d35400;">
                    {{ fundName }} ({{ fundCode }})
@@ -204,13 +177,29 @@
                         {{ meta?.treasury_index_pct != null ? (meta.treasury_index_pct > 0 ? '+' : '') + meta.treasury_index_pct.toFixed(3) + '%' : '-' }}
                      </span>
                   </template>
-                  <!-- 511520 显示国债期货 -->
-                  <template v-if="fundCode === '511520'">
-                     <span style="font-size: 12px; color: #64748b;">国债期货:</span>
-                     <span :style="{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: '14px', color: meta?.futures_pct && meta.futures_pct > 0 ? '#d32f2f' : '#388e3c' }">
-                        {{ meta?.futures_pct != null ? (meta.futures_pct > 0 ? '+' : '') + meta.futures_pct.toFixed(3) + '%' : '-' }}
-                     </span>
-                  </template>
+                   <!-- 511520 显示国债期货 + 手动BP输入 -->
+                   <template v-if="fundCode === '511520'">
+                      <span style="font-size: 12px; color: #64748b;">数据源:</span>
+                      <n-tag :type="meta?.bp_source === 'manual' ? 'warning' : 'info'" size="small" round>
+                         {{ meta?.bp_source === 'manual' ? '手动BP' : meta?.bp_source === 'futures' ? 'T2609期货' : '无数据' }}
+                      </n-tag>
+                      <template v-if="meta?.bp_source === 'manual'">
+                         <span style="font-size: 12px; color: #64748b;">7Y:</span>
+                         <span :style="{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: '14px', color: (meta?.bp_7y || 0) > 0 ? '#d32f2f' : '#388e3c' }">
+                            {{ meta?.bp_7y != null ? (meta.bp_7y > 0 ? '+' : '') + meta.bp_7y.toFixed(1) : '-' }}bp
+                         </span>
+                         <span style="font-size: 12px; color: #64748b;">10Y:</span>
+                         <span :style="{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: '14px', color: (meta?.bp_10y || 0) > 0 ? '#d32f2f' : '#388e3c' }">
+                            {{ meta?.bp_10y != null ? (meta.bp_10y > 0 ? '+' : '') + meta.bp_10y.toFixed(1) : '-' }}bp
+                         </span>
+                      </template>
+                      <template v-else>
+                         <span style="font-size: 12px; color: #64748b;">期货:</span>
+                         <span :style="{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: '14px', color: meta?.futures_pct && meta.futures_pct > 0 ? '#d32f2f' : '#388e3c' }">
+                            {{ meta?.futures_pct != null ? (meta.futures_pct > 0 ? '+' : '') + meta.futures_pct.toFixed(3) + '%' : '-' }}
+                         </span>
+                      </template>
+                   </template>
                </div>
                
                <n-divider vertical style="margin: 0;" />
@@ -267,12 +256,30 @@
                </div>
             </div>
          </div>
+
+         <!-- 511520 手动BP输入面板 -->
+         <div v-if="fundCode === '511520'" style="background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); padding: 10px 16px; border-radius: 8px; border: 1px solid #7dd3fc; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+            <div style="font-size: 13px; color: #0369a1; font-weight: bold; margin-bottom: 6px;">Choice BP手动输入</div>
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+               <span style="font-size: 12px; color: #64748b;">7年期:</span>
+               <input type="number" v-model.number="manualBp7y" step="0.5" 
+                  style="width: 55px; padding: 2px 4px; font-size: 13px; font-family: monospace; border: 1px solid #bae6fd; border-radius: 4px; text-align: center;">
+               <span style="font-size: 11px; color: #94a3b8;">bp</span>
+               <span style="font-size: 12px; color: #64748b;">10年期:</span>
+               <input type="number" v-model.number="manualBp10y" step="0.5"
+                  style="width: 55px; padding: 2px 4px; font-size: 13px; font-family: monospace; border: 1px solid #bae6fd; border-radius: 4px; text-align: center;">
+               <span style="font-size: 11px; color: #94a3b8;">bp</span>
+               <n-button size="tiny" type="primary" @click="submitBpOverride">应用</n-button>
+               <n-button size="tiny" quaternary @click="clearBpOverride">清除</n-button>
+               <span v-if="meta?.bp_source === 'manual'" style="font-size: 11px; color: #d97706; font-weight: bold;">已应用 (今日有效)</span>
+            </div>
+         </div>
       </div>
 
       <!-- 第三行: 估值与对冲数量推演区 -->
       <!-- [现金管理] 隐藏整个区域：债券ETF不需要ETF实时估值/期货校准/纯期货估值 -->
       <div v-if="!isCashManagement" style="display: flex; flex-direction: column; gap: 8px; width: 100%; margin-bottom: 8px;">
-         <!-- Panel 1: ETF实时估值 + 对冲数量（合并） -->
+          <!-- Panel 1: ETF实时估值 + 对冲数量（合并） -->
           <div style="background: #f0f8ff; padding: 8px 14px; border-radius: 8px; border: 1px solid #bae6fd; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
              <!-- 2行3列网格，列宽与基准日估值日信息对齐：160px | 140px | flex -->
              <div style="display: flex; flex-direction: column; gap: 6px; width: 100%;">
@@ -430,67 +437,126 @@
             </div>
          </n-card>
 
-         <!-- 中间：下单执行面板与操作按键 -->
-         <n-card title="交易执行面板" :bordered="false" class="chart-card-middle sandbox-card shadow-soft" size="small" style="background: #fffdf5; border: 1px solid #ffcc80;">
-            <div class="sandbox-layout" style="display: flex; flex-direction: column; gap: 8px;">
-               <!-- 下单区-1: A股 LOF -->
-               <div style="width: 100%; display: flex; align-items: center; gap: 6px; background: #fff5f5; padding: 6px 10px; border-radius: 6px; border: 1px solid #ffcdd2; flex-wrap: wrap; box-sizing: border-box;">
-                  <span style="color:#666; font-size: 12px;">券商:</span>
-                  <n-select v-model:value="lofBroker" size="small" style="width: 130px;" :options="[ { label: '银河QMT', value: 'yinhe_qmt' }, { label: '通达信(华宝)', value: 'tdx' }, { label: '国金QMT', value: 'guojin_qmt' } ]" />
-                  <span style="font-weight:bold; color:#d32f2f; font-size:13px;">{{ fundName }} ({{ fundCode }}):</span>
-                  <div style="flex: 1; min-width: 5px;"></div>
-                  <span style="color:#666; font-size: 12px; white-space: nowrap;">数量:</span>
-                  <n-input-number v-model:value="orderVol" :step="100" size="small" style="width: 110px;" :show-button="false" />
-                  <span style="color:#666; font-size: 12px; white-space: nowrap;">限价:</span>
-                  <n-input-number v-model:value="simLofPrice" :step="0.001" size="small" style="width: 100px;" :show-button="false" />
-               </div>
+          <!-- 中间：Ghost Trader 幽灵做市商控制台 -->
+          <n-card title="👻 幽灵做市商控制台" :bordered="false" class="chart-card-middle sandbox-card shadow-soft" size="small" style="background: #1a1a2e; border: 1px solid #16213e; color: #e0e0e0;">
+             <div style="display: flex; gap: 8px; margin-bottom: 10px; align-items: center; flex-wrap: wrap;">
+                <span style="color: #888; font-size: 12px;">当前基金:</span>
+                <span style="color: #ff003c; font-weight: bold; font-size: 14px;">{{ fundName }} ({{ fundCode }})</span>
+                <span style="color: #888; font-size: 12px;">| 赎回费:</span>
+                <span style="color: yellow; font-family: monospace; font-weight: bold;">{{ ghostData?.redemption_fee?.toFixed(3) || '-' }}%</span>
+                <span style="flex:1;"></span>
+                <span style="color: #888; font-size: 12px;">期望纯利润底线:</span>
+                <n-input-number v-model:value="targetNetProfit" :step="0.05" size="small" style="width: 80px;" :show-button="false" />
+                <span style="color: #888; font-size: 12px;">%</span>
+             </div>
 
-               <!-- 下单区-2: IB ETF -->
-               <div style="width: 100%; display: flex; align-items: center; gap: 6px; background: #e3f2fd; padding: 6px 10px; border-radius: 6px; border: 1px solid #bbdefb; flex-wrap: wrap; box-sizing: border-box;">
-                  <span style="font-weight:bold; color:#1565c0; font-size:13px;">🌍 IB {{ meta?.fund_config?.trade_etf }}:</span>
-                  <div style="flex: 1; min-width: 5px;"></div>
-                  <span style="color:#666; font-size: 12px; white-space: nowrap;">数量:</span>
-                  <n-input-number v-model:value="hedgeVol" :step="10" size="small" style="width: 110px;" :show-button="false" />
-                  <span style="color:#666; font-size: 12px; white-space: nowrap;">限价:</span>
-                  <n-input-number v-model:value="hedgePrice" :step="0.01" size="small" style="width: 100px;" :show-button="false" />
-               </div>
+             <!-- 周末模拟控制栏 -->
+             <div style="display: flex; gap: 8px; margin-bottom: 10px; align-items: center; padding: 6px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px;">
+                <n-tag :type="simRunning ? 'success' : 'default'" size="small" round style="font-weight: bold;">
+                   {{ simRunning ? 'SIM RUNNING' : 'SIM OFF' }}
+                </n-tag>
+                <n-button v-if="!simRunning" size="tiny" type="success" @click="toggleSim('start')">启动模拟</n-button>
+                <n-button v-else size="tiny" type="warning" @click="toggleSim('stop')">停止</n-button>
+                <n-button size="tiny" quaternary @click="toggleSim('reset')">重置</n-button>
+                <n-divider vertical style="margin: 0;" />
+                <n-button size="tiny" :type="simForcedSignal ? 'error' : 'default'" @click="toggleForcedSignal" :style="{ border: simForcedSignal ? '1px solid #ff003c' : '' }">
+                   {{ simForcedSignal ? '强制信号 ON' : '强制信号' }}
+                </n-button>
+                <span v-if="simData" style="color: #666; font-size: 11px; margin-left: 8px;">
+                   tick: {{ simData.tick_count }} | signals: {{ simData.signal_count }}
+                </span>
+             </div>
 
-               <!-- 下单区-3: IB 期货 -->
-               <div v-if="showFutCalib || showPureFut" style="width: 100%; display: flex; align-items: center; gap: 6px; background: #fff3e0; padding: 6px 10px; border-radius: 6px; border: 1px solid #ffcc80; flex-wrap: wrap; box-sizing: border-box;">
-                  <span style="font-weight:bold; color:#e65100; font-size:13px;">🌍 IB期货 ({{ meta?.fund_config?.trade_future }}):</span>
-                  <div style="flex: 1; min-width: 5px;"></div>
-                  <span style="color:#666; font-size: 12px; white-space: nowrap;">数量:</span>
-                  <n-input-number v-model:value="targetLotsFuture" :step="1" size="small" style="width: 110px;" :show-button="false" />
-                  <span style="color:#666; font-size: 12px; white-space: nowrap;">限价:</span>
-                  <n-input-number v-model:value="testFutPrice" :step="0.01" size="small" style="width: 100px;" :show-button="false" />
-               </div>
-            </div>
+             <div style="display: flex; gap: 12px;">
+                <!-- 保守砸单面板 -->
+                <div style="flex: 1; border: 1px solid #333; border-radius: 6px; padding: 10px; background: #16213e;">
+                   <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 8px;">
+                      <span style="font-size: 16px;">🛡️</span>
+                      <h4 style="color: #aaa; margin: 0; font-size: 13px;">保守砸单模式</h4>
+                   </div>
+                   <div style="display: flex; flex-direction: column; gap: 4px; font-size: 12px;">
+                      <div style="display: flex; justify-content: space-between;">
+                         <span style="color: #888;">A股排队价(买一):</span>
+                         <span style="color: #00ff00; font-family: monospace;">￥{{ ghostData?.lof_bid?.toFixed(3) || '-' }}</span>
+                      </div>
+                      <div style="display: flex; justify-content: space-between;">
+                         <span style="color: #888;">直接吃美股买一:</span>
+                         <span style="color: #00ff00; font-family: monospace;">${{ ghostData?.us_bid?.toFixed(2) || '-' }}</span>
+                         <span v-if="ghostData?.us_bid_size" :style="{ color: ghostData.us_bid_size >= 100 ? '#00ff00' : '#ff003c', fontSize: '10px', marginLeft: '4px' }">
+                            (量:{{ ghostData.us_bid_size }})
+                         </span>
+                      </div>
+                      <div v-if="ghostData?.us_bid_size && ghostData.us_bid_size < 100" style="color: #ff003c; font-size: 10px; text-align: center;">
+                         ⚠️ 买一量不足，考虑拆单到买二
+                      </div>
+                      <div style="border-top: 1px solid #333; margin: 4px 0;"></div>
+                      <div style="display: flex; justify-content: space-between;">
+                         <span style="color: #888;">理论折价:</span>
+                         <span :style="{ color: ghostData?.premium_safe && ghostData.premium_safe < 0 ? '#00ff00' : '#ff003c', fontFamily: 'monospace', fontWeight: 'bold' }">
+                            {{ ghostData?.premium_safe != null ? (ghostData.premium_safe > 0 ? '+' : '') + ghostData.premium_safe.toFixed(2) + '%' : '-' }}
+                         </span>
+                      </div>
+                      <div style="display: flex; justify-content: space-between;">
+                         <span style="color: #888;">扣费后利润:</span>
+                         <span :style="{ color: isGhostProfitable('safe') ? '#00ff00' : '#ff003c', fontWeight: 'bold' }">
+                            {{ ghostProfit('safe')?.toFixed(3) || '-' }}%
+                         </span>
+                      </div>
+                      <n-button type="success" size="small" style="width: 100%; margin-top: 6px; font-weight: bold;" :disabled="!isGhostProfitable('safe')" @click="handleGhostPlace('safe')">
+                         立即砸盘套利
+                      </n-button>
+                   </div>
+                </div>
 
-            <!-- 下单按键区 -->
-            <div style="display: flex; flex-direction: column; gap: 10px; width: 100%; margin-top: 12px; border-top: 1px dashed #fed7aa; padding-top: 12px;">
+                <!-- 内卷挂单面板 -->
+                <div style="flex: 1; border: 1px solid #ff003c; border-radius: 6px; padding: 10px; background: #16213e; box-shadow: 0 0 10px rgba(255,0,60,0.2);">
+                   <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 8px;">
+                      <span style="font-size: 16px;">🤺</span>
+                      <h4 style="color: #ff003c; margin: 0; font-size: 13px;">卖一内卷模式 (Pegged)</h4>
+                   </div>
+                   <div style="display: flex; flex-direction: column; gap: 4px; font-size: 12px;">
+                      <div style="display: flex; justify-content: space-between;">
+                         <span style="color: #888;">A股排队价(买一):</span>
+                         <span style="color: #00ff00; font-family: monospace;">￥{{ ghostData?.lof_bid?.toFixed(3) || '-' }}</span>
+                      </div>
+                      <div style="display: flex; justify-content: space-between;">
+                         <span style="color: #888;">抢占美股卖一:</span>
+                         <span style="color: #ff003c; font-family: monospace;">${{ ghostData?.us_ask ? (ghostData.us_ask - 0.01).toFixed(2) : '-' }}</span>
+                         <span style="color: #888; font-size: 10px;">(减$0.01)</span>
+                      </div>
+                      <div style="border-top: 1px solid #333; margin: 4px 0;"></div>
+                      <div style="display: flex; justify-content: space-between;">
+                         <span style="color: #888;">理论折价:</span>
+                         <span :style="{ color: ghostData?.premium_peg && ghostData.premium_peg < 0 ? '#00ff00' : '#ff003c', fontFamily: 'monospace', fontWeight: 'bold' }">
+                            {{ ghostData?.premium_peg != null ? (ghostData.premium_peg > 0 ? '+' : '') + ghostData.premium_peg.toFixed(2) + '%' : '-' }}
+                         </span>
+                      </div>
+                      <div style="display: flex; justify-content: space-between;">
+                         <span style="color: #888;">扣费后利润:</span>
+                         <span :style="{ color: isGhostProfitable('peg') ? '#00ff00' : '#ff003c', fontWeight: 'bold' }">
+                            {{ ghostProfit('peg')?.toFixed(3) || '-' }}%
+                         </span>
+                      </div>
+                      <n-button type="error" size="small" style="width: 100%; margin-top: 6px; font-weight: bold;" :disabled="!isGhostProfitable('peg')" @click="handleGhostPlace('peg')">
+                         启动内卷机器人 (REL)
+                      </n-button>
+                   </div>
+                </div>
+             </div>
 
-               
-               <!-- 第一行：买入/开仓按键 -->
-               <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
-                  <n-button type="success" style="flex: 1; min-width: 110px; font-weight:bold;" @click="sendOrder('BUY', 'lof')">{{ fundCode }} 折价买入</n-button>
-                  <n-button type="warning" style="flex: 1; min-width: 110px; font-weight:bold;" @click="sendOrder('SELL', 'ib')">IB {{ meta?.fund_config?.trade_etf }} 卖空</n-button>
-                  <n-button v-if="showFutCalib || showPureFut" type="warning" style="flex: 1; min-width: 110px; font-weight:bold;" @click="sendOrder('SELL', 'ib_future')">{{ meta?.fund_config?.trade_future }} 期货卖空</n-button>
-               </div>
-               <!-- 第二行：卖出/平仓按键 -->
-               <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
-                  <n-button type="error" style="flex: 1; min-width: 110px; font-weight:bold;" @click="sendOrder('SELL', 'lof')">{{ fundCode }} 溢价卖出</n-button>
-                  <n-button type="info" style="flex: 1; min-width: 110px; font-weight:bold;" @click="sendOrder('BUY', 'ib')">IB {{ meta?.fund_config?.trade_etf }} 买平</n-button>
-                  <n-button v-if="showFutCalib || showPureFut" type="info" style="flex: 1; min-width: 110px; font-weight:bold;" @click="sendOrder('BUY', 'ib_future')">{{ meta?.fund_config?.trade_future }} 期货买平</n-button>
-               </div>
-            </div>
+             <!-- 交易日志 -->
+             <div style="margin-top: 10px; border-top: 1px solid #333; padding-top: 8px;">
+                <div style="font-size: 11px; color: #666; margin-bottom: 4px;">📝 交易日志:</div>
+                <div style="background: #0a0a0a; border-radius: 4px; padding: 6px; max-height: 80px; overflow-y: auto; font-family: monospace; font-size: 11px; color: #00ff00;">
+                   <div v-for="(log, i) in ghostLogs" :key="i" style="margin-bottom: 2px;">
+                      <span style="color: #666;">{{ log.time }}</span> {{ log.msg }}
+                   </div>
+                   <div v-if="ghostLogs.length === 0" style="color: #666;">等待信号...</div>
+                </div>
+             </div>
+          </n-card>
 
-            <div style="margin-top: 8px; display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: #888;">
-               <n-checkbox v-model:checked="autoLog" size="small">同步记账</n-checkbox>
-               <span>* 实时参数更新</span>
-            </div>
-         </n-card>
-
-         <!-- 右侧：外盘/期货实时行情盘口 (IB/Futu) -->
+          <!-- 右侧：外盘/期货实时行情盘口 (IB/Futu) -->
          <n-card title="外盘/期货 盘口" :bordered="false" class="depth-table-card-right shadow-soft" size="small">
             <template #header-extra>
                <n-tag size="tiny" :type="foreignSource.includes('等待') ? 'default' : 'success'">{{ foreignSource }}</n-tag>
@@ -531,95 +597,9 @@
                </div>
             </div>
          </n-card>
-      </div>
-
-      <!-- [现金管理] 估值算法历史记录表 (替代分时曲线图) -->
-      <n-card v-if="isCashManagement && (fundCode === '511520' || fundCode === '511360') && historyBacktestData.length > 0" :title="fundCode === '511520' ? '估值算法回测 (预估 vs 实际)' : '历史记录'" :bordered="false" class="shadow-soft" style="margin-top: 12px;" size="small">
-         <template #header-extra>
-            <span v-if="fundCode === '511520'" style="font-size: 12px; color: #64748b;">公式: 前日NAV + 0.0082 + 前日NAV × T2609涨幅% × 1.0</span>
-         </template>
-         <div style="overflow-x: auto;">
-            <table style="width: 100%; border-collapse: collapse; font-size: 12px; font-family: monospace;">
-               <thead>
-                  <tr style="background: #f8fafc; border-bottom: 2px solid #e2e8f0;">
-                     <th style="padding: 6px 8px; text-align: left;">日期</th>
-                     <th style="padding: 6px 8px; text-align: right;">净值涨幅</th>
-                     <th style="padding: 6px 8px; text-align: right;">收盘价</th>
-                     <template v-if="fundCode === '511520'">
-                        <th style="padding: 6px 8px; text-align: right;">T2609%</th>
-                        <th style="padding: 6px 8px; text-align: right;">预估NAV</th>
-                     </template>
-                     <th style="padding: 6px 8px; text-align: right;">实际NAV</th>
-                     <template v-if="fundCode === '511520'">
-                        <th style="padding: 6px 8px; text-align: right;">误差</th>
-                        <th style="padding: 6px 8px; text-align: right;">误差率</th>
-                     </template>
-                     <template v-if="fundCode === '511360'">
-                        <th style="padding: 6px 8px; text-align: right;">国债指数%</th>
-                     </template>
-                  </tr>
-               </thead>
-               <tbody>
-                  <tr v-for="(row, idx) in historyBacktestData" :key="idx" :style="{ background: row.estimation_error_pct != null && row.estimation_error_pct > 0.05 ? '#fef2f2' : 'transparent', borderBottom: '1px solid #f1f5f9' }">
-                     <td style="padding: 4px 8px;">{{ row.date ? row.date.substring(5) : '-' }}</td>
-                     <!-- 净值涨幅 = 今日NAV / 昨日NAV - 1 -->
-                     <td style="padding: 4px 8px; text-align: right;">
-                        <template v-if="row.nav && idx < historyBacktestData.length - 1 && historyBacktestData[idx + 1].nav">
-                           <span :style="{ color: (row.nav / historyBacktestData[idx + 1].nav - 1) > 0 ? '#d32f2f' : (row.nav / historyBacktestData[idx + 1].nav - 1) < 0 ? '#388e3c' : '#999', fontWeight: 'bold' }">
-                              {{ ((row.nav / historyBacktestData[idx + 1].nav - 1) * 100).toFixed(3) }}%
-                           </span>
-                        </template>
-                        <span v-else style="color: #999;">-</span>
-                     </td>
-                     <!-- 收盘价 -->
-                     <td style="padding: 4px 8px; text-align: right;">{{ row.price != null ? row.price.toFixed(3) : '-' }}</td>
-                     <!-- 511520 专属列 -->
-                     <template v-if="fundCode === '511520'">
-                        <td style="padding: 4px 8px; text-align: right;" :style="{ color: row.futures_pct != null ? (row.futures_pct > 0 ? '#d32f2f' : '#388e3c') : '#999' }">{{ row.futures_pct != null ? (row.futures_pct > 0 ? '+' : '') + row.futures_pct.toFixed(3) + '%' : '-' }}</td>
-                        <td style="padding: 4px 8px; text-align: right; font-weight: bold; color: #1565c0;">{{ row.estimated_nav != null ? row.estimated_nav.toFixed(4) : '-' }}</td>
-                     </template>
-                     <td style="padding: 4px 8px; text-align: right; font-weight: bold;">{{ row.nav != null ? row.nav.toFixed(4) : '-' }}</td>
-                     <!-- 511520 误差列 -->
-                     <template v-if="fundCode === '511520'">
-                        <td style="padding: 4px 8px; text-align: right;" :style="{ color: row.estimation_error != null ? (row.estimation_error > 0 ? '#388e3c' : '#d32f2f') : '#999' }">{{ row.estimation_error != null ? (row.estimation_error > 0 ? '+' : '') + row.estimation_error.toFixed(4) : '-' }}</td>
-                        <td style="padding: 4px 8px; text-align: right;">
-                           <n-tag v-if="row.estimation_error_pct != null" :type="row.estimation_error_pct <= 0.05 ? 'success' : row.estimation_error_pct <= 0.10 ? 'warning' : 'error'" size="tiny" round>
-                              {{ row.estimation_error_pct.toFixed(4) }}%
-                           </n-tag>
-                           <span v-else style="color: #999;">-</span>
-                        </td>
-                     </template>
-                     <!-- 511360 国债指数列 -->
-                     <template v-if="fundCode === '511360'">
-                        <td style="padding: 4px 8px; text-align: right;" :style="{ color: row.idx_pct != null ? (row.idx_pct > 0 ? '#d32f2f' : '#388e3c') : '#999' }">{{ row.idx_pct != null ? (row.idx_pct > 0 ? '+' : '') + row.idx_pct.toFixed(3) + '%' : '-' }}</td>
-                     </template>
-                  </tr>
-               </tbody>
-            </table>
-         </div>
-         <!-- 511520 回测统计 -->
-         <div v-if="fundCode === '511520'" style="margin-top: 8px; font-size: 11px; color: #64748b; display: flex; gap: 16px;">
-            <span>有效回测天数: {{ historyBacktestData.filter(r => r.estimation_error_pct != null).length }}</span>
-            <span>平均误差: {{ (historyBacktestData.filter(r => r.estimation_error_pct != null).reduce((s, r) => s + r.estimation_error_pct, 0) / Math.max(historyBacktestData.filter(r => r.estimation_error_pct != null).length, 1)).toFixed(4) }}%</span>
-            <span>最大误差: {{ Math.max(...historyBacktestData.filter(r => r.estimation_error_pct != null).map(r => r.estimation_error_pct), 0).toFixed(4) }}%</span>
-            <span>≤0.05%: {{ (historyBacktestData.filter(r => r.estimation_error_pct != null && r.estimation_error_pct <= 0.05).length / Math.max(historyBacktestData.filter(r => r.estimation_error_pct != null).length, 1) * 100).toFixed(1) }}%</span>
-            <span>≤0.10%: {{ (historyBacktestData.filter(r => r.estimation_error_pct != null && r.estimation_error_pct <= 0.10).length / Math.max(historyBacktestData.filter(r => r.estimation_error_pct != null).length, 1) * 100).toFixed(1) }}%</span>
-         </div>
-      </n-card>
-
-      <!-- 第六行: 分时曲线图 (从中间移到下方) -->
-      <!-- [现金管理] 隐藏：债券ETF无分时采样数据 -->
-      <n-card v-if="!isCashManagement" title="分时对冲走势 (1分钟采样)" :bordered="false" class="shadow-soft" style="margin-top: 12px;" size="small">
-         <template #header-extra>
-            <n-tag :type="intradayData.length > 0 ? 'success' : 'warning'" size="tiny" round>{{ intradayData.length }} 采样点</n-tag>
-         </template>
-         <div class="chart-container" style="height: 300px;">
-           <n-empty v-if="intradayData.length === 0" description="该日期暂无采样数据" style="padding-top: 60px;" />
-           <v-chart v-else class="chart" :option="chartOption" autoresize />
-         </div>
-      </n-card>
-    </div>
-  </div>
+       </div>
+     </div>
+   </div>
 </template>
 
 <script setup lang="ts">
@@ -635,7 +615,7 @@ import { CanvasRenderer } from 'echarts/renderers'
 import { LineChart, BarChart } from 'echarts/charts'
 import { TitleComponent, TooltipComponent, GridComponent, LegendComponent, DataZoomComponent, VisualMapComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
-import { getDashboard, getFundIntraday, getFundBasket, getFundHistory, getFundValuationMeta, getRealtimeQuote, placeOrder, addTrade } from '../api'
+import { getDashboard, getFundIntraday, getFundBasket, getFundHistory, getFundValuationMeta, getRealtimeQuote, placeOrder, addTrade, postGhostPlaceOrder, getGhostSimStatus, postGhostSimControl, postBpOverride, getBpOverride, clearBpOverride as clearBpOverrideApi } from '../api'
 
 use([CanvasRenderer, LineChart, BarChart, TitleComponent, TooltipComponent, GridComponent, LegendComponent, DataZoomComponent, VisualMapComponent])
 
@@ -647,10 +627,53 @@ const dialog = useDialog()
 // 基础状态
 const fundCode = ref((route.query.code as string) || '')
 const fundName = ref((route.query.name as string) || '')
+
+// [V10.10] 基金选择器：预设下拉 + 手动输入
+const presetFundCodes = ['162411', '164701', '164824']
+const manualFundCode = ref('')
+const selectedFundCode = ref(fundCode.value || '')
+const fundDropdownOptions = computed(() =>
+  presetFundCodes.map(c => ({ label: c, value: c }))
+)
+const onFundSelected = (code: string) => {
+  if (!code) return
+  loadFundByCode(code)
+}
+const onManualFundEnter = () => {
+  if (manualFundCode.value.trim()) loadFundByCode(manualFundCode.value.trim())
+}
+const onManualFundSubmit = () => {
+  if (manualFundCode.value.trim()) loadFundByCode(manualFundCode.value.trim())
+}
+const loadFundByCode = async (code: string) => {
+  code = code.trim()
+  if (!code || !/^\d{6}$/.test(code)) {
+    message.warning('请输入 6 位基金代码')
+    return
+  }
+  // 先查数据库获取基金名
+  try {
+    const res = await getFundValuationMeta(code)
+    if (res.data?.status === 'ok') {
+      fundCode.value = code
+      selectedFundCode.value = code
+      fundName.value = res.data.fund_name || code
+      manualFundCode.value = ''
+      // 重置初始化标志，让 simLofPrice 重新加载
+      isLofPriceInitialized.value = false
+      // 重新加载所有数据
+      fetchAll()
+      message.success(`已加载 ${fundName.value} (${code})`)
+    } else {
+      message.error('基金不存在或加载失败')
+    }
+  } catch (e: any) {
+    message.error('加载失败: ' + (e.message || e))
+  }
+}
 const opportunityData = ref<any[]>([])
 const intradayData = ref<any[]>([])
 const basketData = ref<any[]>([])
-const historyBacktestData = ref<any[]>([])
 const loading = ref(false)
 const selectedDate = ref(Date.now())
 const showFutCalib = ref(false)
@@ -662,6 +685,172 @@ const premiumThreshold = ref(-0.5)
 const premiumUpperThreshold = ref(2.0)
 const showWatchlistOnly = ref(false) // 我的自选Tab（默认关闭，选中分类时才不会过滤掉非自选基金）
 const watchlist = ref<string[]>(JSON.parse(localStorage.getItem('watchlist') || '[]')) // 自选基金列表
+
+// Ghost Trader 幽灵做市商 — 从 meta.value.realtime_quotes 前端计算，无需独立 API
+const ghostLogs = ref<{ time: string; msg: string }[]>([])
+const targetNetProfit = ref(Number(localStorage.getItem('ghostNetProfit')) || 0.3)
+const ghostData = computed(() => {
+  if (!meta.value?.realtime_quotes) return null
+  const rq = meta.value.realtime_quotes
+  const bd = meta.value.base_data || {}
+  const cfg = meta.value.fund_config || {}
+  const tradeEtf = cfg.trade_etf || ''
+  const fundCode = meta.value.fund_config?.code || ''
+  const lofQ = rq[fundCode]
+  const usQ = rq[tradeEtf]
+  const bNav = parseFloat(bd.nav) || 0
+  const bPos = (parseFloat(cfg.position) || 95) / 100
+  const fx = parseFloat(meta.value.latest_exchange_rate) || 0
+  const bHedge = parseFloat(bd.hedge) || 0
+  // 确保 bid/ask 取单值（某些源返回数组 [价, 量]）
+  const getVal = (v: any): number => {
+    if (v == null) return 0
+    if (Array.isArray(v)) return parseFloat(v[0]) || 0
+    return parseFloat(v) || 0
+  }
+  // Ghost Trader 使用 A股盘口买一价（depth.bid[0]），而非 realtime_quotes（可能不准/是最新价）
+  const lofBid = depth.bid && depth.bid[0] ? depth.bid[0] : getVal(lofQ?.bid || lofQ?.price || simLofPrice.value || (bd.close as any))
+  const usBid = getVal(usQ?.bid || usQ?.price)
+  const usAsk = getVal(usQ?.ask || usQ?.price)
+  const usBidSize = Array.isArray(usQ?.bid_size) ? (usQ.bid_size[1] || usQ.bid_size[0]) : (usQ?.bid_size || 0)
+  // 保守砸单：用美股买一价
+  let valSafe = 0, premiumSafe = 0
+  if (bNav > 0 && bHedge > 0 && usBid > 0 && fx > 0) {
+    valSafe = bNav * (1 - bPos) + (usBid * fx) / bHedge
+    premiumSafe = lofBid > 0 ? (lofBid / valSafe - 1) * 100 : 0
+  }
+  // 卖一内卷：用美股卖一价减 $0.01
+  const pegPrice = usAsk > 0.01 ? usAsk - 0.01 : usAsk
+  let valPeg = 0, premiumPeg = 0
+  if (bNav > 0 && bHedge > 0 && pegPrice > 0 && fx > 0) {
+    valPeg = bNav * (1 - bPos) + (pegPrice * fx) / bHedge
+    premiumPeg = lofBid > 0 ? (lofBid / valPeg - 1) * 100 : 0
+  }
+  return {
+    lof_bid: lofBid,
+    us_bid: usBid,
+    us_ask: usAsk,
+    us_bid_size: usBidSize,
+    premium_safe: premiumSafe,
+    premium_peg: premiumPeg,
+    redemption_fee: 0.50,
+  }
+})
+
+// Ghost Simulator 周末模拟
+const simRunning = ref(false)
+const simData = ref<any>(null)
+const simForcedSignal = ref(false)
+let simTimer: any = null
+
+const fetchSimStatus = async () => {
+  try {
+    const res = await getGhostSimStatus()
+    if (res.data.status === 'ok') {
+      simData.value = res.data.data
+      simRunning.value = res.data.data.running
+      simForcedSignal.value = res.data.data.forced_signal
+      // Push sim ticks to ghostLogs
+      if (res.data.data.current) {
+        const c = res.data.data.current
+        const sigMark = c.signal_safe || c.signal_peg ? ' --> SIGNAL!' : ''
+        const msg = `162411=${c.lof.bid.toFixed(4)} XOP=${c.us.bid.toFixed(2)} fx=${c.fx.toFixed(4)} prem=${c.premium_safe.toFixed(3)}% net=${c.net_profit_safe.toFixed(3)}%${sigMark}`
+        addGhostLog(`[SIM] ${msg}`)
+      }
+    }
+  } catch (e) { /* simulator not loaded */ }
+}
+
+const toggleSim = async (action: string) => {
+  try {
+    await postGhostSimControl(action)
+    await fetchSimStatus()
+    if (action === 'start' && !simTimer) {
+      simTimer = setInterval(fetchSimStatus, 5000)
+    } else if ((action === 'stop' || action === 'reset') && simTimer) {
+      clearInterval(simTimer)
+      simTimer = null
+    }
+  } catch (e) { /* ignore */ }
+}
+
+const toggleForcedSignal = async () => {
+  try {
+    await postGhostSimControl('force_signal', { enabled: !simForcedSignal.value })
+    simForcedSignal.value = !simForcedSignal.value
+  } catch (e) { /* ignore */ }
+}
+
+// 511520 BP Manual Input
+const manualBp7y = ref(0)
+const manualBp10y = ref(0)
+
+const submitBpOverride = async () => {
+  try {
+    const res = await postBpOverride(fundCode.value, manualBp7y.value, manualBp10y.value)
+    if (res.data.status === 'ok') {
+      message.success(`BP已应用: 7Y=${manualBp7y.value}bp, 10Y=${manualBp10y.value}bp`)
+      fetchValuationMeta()
+    }
+  } catch (e: any) {
+    message.error('BP应用失败: ' + (e.message || e))
+  }
+}
+
+const clearBpOverride = async () => {
+  try {
+    await clearBpOverrideApi(fundCode.value)
+    manualBp7y.value = 0
+    manualBp10y.value = 0
+    message.info('BP已清除，恢复期货数据')
+    fetchValuationMeta()
+  } catch (e: any) {
+    message.error('BP清除失败')
+  }
+}
+
+watch(targetNetProfit, (newVal) => {
+  localStorage.setItem('ghostNetProfit', newVal.toString())
+})
+
+const ghostProfit = (mode: 'safe' | 'peg') => {
+  if (!ghostData.value) return null
+  const premium = mode === 'safe' ? ghostData.value.premium_safe : ghostData.value.premium_peg
+  const fee = ghostData.value.redemption_fee || 0.5
+  return Math.abs(premium) - fee
+}
+
+const isGhostProfitable = (mode: 'safe' | 'peg') => {
+  const profit = ghostProfit(mode)
+  return profit !== null && profit >= targetNetProfit.value
+}
+
+const addGhostLog = (msg: string) => {
+  const now = new Date()
+  const time = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`
+  ghostLogs.value.unshift({ time, msg })
+  if (ghostLogs.value.length > 50) ghostLogs.value.pop()
+}
+
+const handleGhostPlace = async (mode: 'safe' | 'peg') => {
+  if (!isGhostProfitable(mode)) {
+    message.warning('利润未达标，无法下单')
+    return
+  }
+  try {
+    const res = await postGhostPlaceOrder(mode, fundCode.value)
+    if (res.data.status === 'ok') {
+      addGhostLog(`✅ ${mode === 'safe' ? '保守砸单' : '内卷挂单'} 下单成功`)
+      message.success(`${mode === 'safe' ? '保守砸单' : '内卷挂单'} 已触发`)
+    } else {
+      addGhostLog(`❌ 下单失败: ${res.data.message || '未知错误'}`)
+      message.error('下单失败')
+    }
+  } catch (e: any) {
+    addGhostLog(`❌ 下单异常: ${e.message}`)
+    message.error('下单异常')
+  }
+}
 
 // 分类映射：前端显示名称 → 数据库category值
 const categoryMap: Record<string, string[]> = {
@@ -1311,6 +1500,7 @@ watch(() => route.query.code, (newCode) => {
   fundCode.value = (newCode as string) || ''; fundName.value = (route.query.name as string) || ''
   isLofPriceInitialized.value = false
   simLofPrice.value = 0
+  ghostLogs.value = []
   // orderVol 保持用户设置，不做自动覆盖
   if (fundCode.value) fetchAll(); else fetchDashboard()
 })
@@ -1386,10 +1576,6 @@ const fetchHistoryMeta = async () => {
             const latest = res.data.data[0]
             navDate.value = latest.nav_date || '-'; t2Nav.value = latest.nav || 0
             t1StaticVal.value = latest.static_val || 0; calibrationValue.value = latest.calibration || '-'
-            // [现金管理] 存储完整历史数据用于回测表展示
-            if (fundCode.value === '511520' || fundCode.value === '511360') {
-                historyBacktestData.value = res.data.data
-            }
         }
     } catch (e) {}
 }
@@ -1587,8 +1773,14 @@ onMounted(() => {
     if (fundCode.value) fetchAll()
     else fetchDashboard()
     realtimeTimer = setInterval(pollRealtime, 3000)
+    // Ghost Trader — 模拟器状态检测
+    fetchSimStatus().then(() => {
+      if (simRunning.value) {
+        simTimer = setInterval(fetchSimStatus, 5000)
+      }
+    })
 })
-onUnmounted(() => { if (realtimeTimer) clearInterval(realtimeTimer) })
+onUnmounted(() => { if (realtimeTimer) clearInterval(realtimeTimer); if (simTimer) clearInterval(simTimer) })
 </script>
 
 <style scoped>

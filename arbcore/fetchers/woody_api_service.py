@@ -122,9 +122,15 @@ class WoodyAPIService:
         except Exception as e:
             logger.error(f"⚠️ 生成备份文件失败: {e}")
 
-        # 5. 调用提纯入库逻辑
+        # 5. 验证数据有效性（防止错误信息被标记为成功）
+        if not isinstance(api_data, dict) or len(api_data) == 0:
+            logger.error(f"❌ [{source_id}] API 返回数据无效（非字典或为空），不标记防刷。原始内容: {str(api_data)[:200]}")
+            return None
+
+        # 6. 调用提纯入库逻辑
         WoodyAPIService.process(db, api_data, source_id)
 
+        # 7. 数据验证通过后才标记防刷（修复 bug：之前错误信息也会被标记）
         db.mark_access_synced(today_str, sync_key)
         logger.info(f"✅ [{source_id}] 因子提纯入库与双备份完毕！")
         return api_data
@@ -172,6 +178,15 @@ class WoodyAPIService:
             nav_val = float(f_data['netvalue']) if f_data.get('netvalue') else None
             
             db.upsert_fund_factor(date=b_date, fund_code=fund_code, calibration=cal, hedge=hed, position=pos, nav=nav_val)
+            
+            # 🌟 Woody API 返回了真实仓位时，同步更新 unified_fund_list.pos_ratio
+            raw_pos = f_data.get('position')
+            if raw_pos is not None:
+                try:
+                    clean_pos = float(raw_pos)/100.0 if float(raw_pos) > 2 else float(raw_pos)
+                    db.update_fund_pos_ratio(fund_code, clean_pos)
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"⚠️ 解析 position 失败 {fund_code}: raw={raw_pos}, err={e}")
             
             # 保存 Woody 提供的估值日汇率 (CNYest) 到汇率表 (可选的增强)
             if e_date and f_data.get('CNYest'):

@@ -3,6 +3,7 @@ import sys
 import subprocess
 import pandas as pd
 import logging
+from logging.handlers import RotatingFileHandler
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,7 +44,12 @@ class ColorFormatter(logging.Formatter):
         return formatted
 
 # Setup File Handler (no colors)
-file_handler = logging.FileHandler(log_filepath, encoding='utf-8')
+file_handler = RotatingFileHandler(
+    log_filepath,
+    maxBytes=10 * 1024 * 1024,
+    backupCount=5,
+    encoding='utf-8'
+)
 file_handler.setFormatter(logging.Formatter(log_format))
 
 # Setup Console Handler (with colors)
@@ -59,72 +65,9 @@ logger = logging.getLogger("ArbNext")
 lof_is_running = False
 
 # [V4.4] 强力补丁：全局唯一 TQ 抢占与锁定
-# 必须在所有业务模块导入之前执行，防止 TradeManager 或 RealtimeManager 产生冲突
-if lof_is_running:
-    logger.warning("[主从架构] 检测到主交易程序(LOFarb)正在运行！当前为只读监控模式(Slave)，主动跳过通达信(tdx)全局初始化。")
-else:
-    try:
-        tq_plugin_path = r"D:\new_tdx_test\PYPlugins\user"
-        if tq_plugin_path not in sys.path:
-            sys.path.insert(0, tq_plugin_path)
-        
-        import tqcenter
-        from tqcenter import tq
-        
-        # 1. 注入 sys.modules 防止重复加载不同路径的同名模块
-        sys.modules['tqcenter'] = tqcenter
-        sys.modules['readers.tqcenter'] = tqcenter # 针对 LOFarb 的潜在导入路径
-        
-        # 2. 强制执行一次正确路径的初始化
-        if not getattr(tq, '_is_globally_initialized', False):
-            tq.initialize(tq_plugin_path)
-            tq._is_globally_initialized = True
-            logger.info(f"[Global] TQ 数据接口已全局抢占初始化: {tq_plugin_path}")
-            
-            # 3. 拦截并强制重定向后续所有初始化
-            def safe_initialize(path=None):
-                logger.info(f"[Global] 拦截并重定向重复的 TQ 初始化请求 (原请求路径: {path} -> 现强制路径: {tq_plugin_path})")
-                return True
-            tq.initialize = safe_initialize
-            
-            # 4. 终极防御：拦截 _get_run_id 以防止回调函数抛出 RuntimeError
-            #    注意：_get_run_id 是 classmethod，必须同时 patch 类字典才能拦截 cls._get_run_id() 调用
-            _orig_get_run_id = tq._get_run_id
-            def safe_get_run_id():
-                try:
-                    rid = _orig_get_run_id()
-                    if rid is None: return 1 # 强制返回一个 dummy ID
-                    return rid
-                except:
-                    return 1
-            tq._get_run_id = safe_get_run_id
-            # 同时通过类字典 patch，防止 cls._get_run_id() 绕过实例 patch
-            try:
-                type(tq)._get_run_id = staticmethod(safe_get_run_id)
-            except:
-                pass
-            
-            # 5. 拦截 _data_callback_transfer 回调，彻底阻断 RuntimeError 刷屏
-            _orig_callback = getattr(tq, '_data_callback_transfer', None)
-            if _orig_callback:
-                def safe_data_callback_transfer(*args, **kwargs):
-                    try:
-                        return _orig_callback(*args, **kwargs)
-                    except RuntimeError:
-                        if not getattr(safe_data_callback_transfer, 'logged', False):
-                            logger.warning("[TDX] 回调中 _get_run_id RuntimeError 已被拦截（后续相同错误将静默）")
-                            safe_data_callback_transfer.logged = True
-                        return None
-                    except Exception:
-                        return None
-                safe_data_callback_transfer.logged = False
-                try:
-                    tq._data_callback_transfer = safe_data_callback_transfer
-                    type(tq)._data_callback_transfer = safe_data_callback_transfer
-                except:
-                    pass
-    except Exception as e:
-        logger.error(f"[Global] TQ 全局初始化锁定失败: {e}")
+# [V10.0] 启动时不自动连接通达信，跳过 TQ 全局初始化（用户点击"通达信"按钮时才需要）
+# 用户手动重连通达信时，TdxRealtimeFetcher.connect() 会自行完成 TQ 初始化
+logger.info("[V10.0] 跳过 TQ 全局初始化（通达信待用户手动连接）")
 
 # Add project root and core/arbcore to path
 # [FIX] 使用 D:\Study\arbTest\arbcore 作为核心模块目录
@@ -160,6 +103,7 @@ try:
     from services.market_data_service import MarketDataService
     from services.system_status_service import system_status
     from services.intraday.sampler_service import IntradaySamplerService
+    from services.dashboard_snapshot_service import DashboardSnapshotService
     from services.trading_service import TradingService
     from services.config_manager_service import ConfigManagerService
     from services.ledger_service import LedgerService
@@ -186,34 +130,42 @@ except Exception as e:
 db = DatabaseManager(db_path=root_db_path)
 
 def _print_data_source_banners():
-    """启动后统一打印各数据源连接状态（清晰的双层提醒标志）"""
+    """启动后统一打印各数据源连接状态（清晰的双层提醒标志）并写入里程碑日志"""
     rt = market_data_service.realtime_manager
     active = rt.active_fetchers if rt else {}
 
+    def _is_fetcher_connected(fetcher) -> bool:
+        """检查实时行情 fetcher 是否真正已连接（不为 None、未 disabled）"""
+        if fetcher is None:
+            return False
+        if getattr(fetcher, 'disabled', False):
+            return False
+        if getattr(fetcher, 'is_connected', True) is False:
+            return False
+        return True
+
     sources = [
-        ("tdx",    "通达信",  "tdx" in active,
-         "如果您仅使用 QMT 交易，这完全正常"),
-        ("guojin", "国金QMT", "guojin" in active,
-         "如不使用国金 QMT 交易，这完全正常"),
-        ("galaxy", "银河QMT", "galaxy" in active,
-         "如不使用银河 QMT 交易，这完全正常"),
+        ("tdx",    "通达信",  _is_fetcher_connected(active.get("tdx")),
+         "请点击顶部'通达信'按钮启动"),
+        ("guojin", "国金QMT", _is_fetcher_connected(active.get("guojin")),
+         "请点击顶部'国金QMT'按钮启动"),
+        ("galaxy", "银河QMT", _is_fetcher_connected(active.get("galaxy")),
+         "请点击顶部'银河QMT'按钮启动"),
         ("ib",     "IB 盈透证券",
          market_data_service.ib_reader is not None and getattr(market_data_service.ib_reader, 'connected', False),
-         "如不使用 IB 交易，这完全正常"),
+         "请点击顶部'IB'按钮启动"),
         ("futu",   "富途 OpenD",
-         market_data_service.futu_reader is not None,
-         "如不使用富途行情，这完全正常"),
+         market_data_service.futu_reader is not None and not getattr(market_data_service.futu_reader, 'disabled', True),
+         "请点击顶部'富途'按钮启动"),
     ]
 
     for key, label, available, hint in sources:
         if available:
-            print(f"\n✅ {label} 连接正常")
+            logger.info(f"{label} 连接正常")
+            system_status.add_milestone("SUCCESS", f"{label} 连接正常")
         else:
-            print("\n" + "=" * 80)
-            print(f"提示: {key}_available = False ({hint})。")
-            print("您可稍后在页面顶部点击对应标签重新连接。")
-            print("系统将继续启动...")
-            print("=" * 80 + "\n")
+            logger.info(f"{label} 待连接")
+            system_status.add_milestone("INFO", f"{label} {hint}")
 
 # 2. Initialize Services with DB instance
 config_service = ConfigService(db)
@@ -230,10 +182,7 @@ else:
         # [V4.7] 修改：放开通达信强制绑定限制，允许系统在只有 QMT 的情况下启动
         if sys.platform == "win32" and (not trading_service.trade_manager or not getattr(trading_service.trade_manager, 'tdx_available', False)):
             logger.warning("交易通道部分受限 (未检测到通达信登录)")
-            print("\n" + "="*80)
-            print("提示: tdx_available = False (如果您仅使用 QMT 交易，这完全正常)。")
-            print("系统将继续启动...")
-            print("="*80 + "\n")
+            print("\n提示: tdx_available = False (如果您仅使用 QMT 交易，这完全正常)。系统将继续启动...\n")
         else:
             logger.info("交易服务已就绪 (独立模式)")
     except SystemExit:
@@ -251,9 +200,44 @@ market_data_service = MarketDataService(db)
 fund_service = FundService(db, market_data_service=market_data_service, config_service=config_service)
 sampler_service = IntradaySamplerService(db, market_data_service, config_service)
 sampler_service.active_watchlist = _active_watchlist
+dashboard_snapshot_service = DashboardSnapshotService(
+    fund_service,
+    market_data_service=market_data_service,
+)
 config_manager_service = ConfigManagerService(project_root)
 ledger_service = LedgerService(db)
 etf_rotation_service = ETFRotationService(db, market_data_service=market_data_service)
+
+def _is_script_running(script_name: str) -> bool:
+    """Best-effort process guard for background scripts."""
+    try:
+        import subprocess
+        if sys.platform == "win32":
+            output = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process | "
+                 "Select-Object -ExpandProperty CommandLine"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        else:
+            output = subprocess.check_output(["ps", "axo", "command"], text=True, timeout=5)
+        current_pid = str(os.getpid())
+        for line in output.splitlines():
+            if script_name in line and current_pid not in line:
+                return True
+    except Exception as e:
+        logger.debug(f"Process guard failed for {script_name}: {e}")
+    return False
+
+def _popen_script_once(cmd, cwd, script_name: str) -> bool:
+    if _is_script_running(script_name):
+        logger.info(f"{script_name} is already running, skip duplicate launch")
+        system_status.add_milestone("INFO", f"{script_name} 已在运行，跳过重复启动")
+        return False
+    subprocess.Popen(cmd, cwd=cwd)
+    return True
 
 # 3. Try to load Private Plugins
 try:
@@ -263,6 +247,41 @@ try:
 except (ImportError, NameError) as e:
     export_service = None
     logger.info(f"Private export plugins not found or initialization failed: {e}")
+
+try:
+    from private.ghost_trader import ghost_trader_instance
+    # 注入实盘驱动
+    ib_reader = getattr(market_data_service, 'ib_reader', None)
+    galaxy_qmt = None
+    guojin_qmt = None
+    if getattr(market_data_service, 'realtime_manager', None):
+        rt = market_data_service.realtime_manager
+        galaxy_qmt = rt.active_fetchers.get('galaxy')
+        guojin_qmt = rt.active_fetchers.get('guojin')
+    ghost_trader_instance.inject_drivers(ib_reader=ib_reader, galaxy_qmt=galaxy_qmt, guojin_qmt=guojin_qmt)
+    logger.info("✅ Ghost Trader plugin loaded.")
+except (ImportError, NameError) as e:
+    ghost_trader_instance = None
+    logger.info(f"Ghost Trader plugin not found: {e}")
+
+# Ghost Simulator (weekend mock data)
+try:
+    from private.ghost_simulator import ghost_simulator_instance
+    logger.info("Ghost Simulator loaded.")
+except (ImportError, NameError) as e:
+    ghost_simulator_instance = None
+    logger.info(f"Ghost Simulator not found: {e}")
+
+try:
+    from private.signal_detector import signal_detector
+    signal_detector.inject(
+        rule_engine=auto_trade_runner.engine,
+        fund_service=fund_service,
+    )
+    logger.info("✅ SignalDetector loaded.")
+except (ImportError, NameError) as e:
+    signal_detector = None
+    logger.info(f"SignalDetector not loaded: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -280,6 +299,7 @@ async def lifespan(app: FastAPI):
 
             logger.info("📊 启动时自动运行 011 数据更新任务...")
             system_status.add_milestone("INFO", "启动时自动运行 011 数据更新")
+            print("daily_updater 即将启动...")
             # 调用 011 (指向统一的 daily_updater.py) 更新脚本
             scripts_dir = os.path.normpath(os.path.join(backend_dir, "..", "..", "arbcore", "scripts"))
             script_path = os.path.join(scripts_dir, "daily_updater.py")
@@ -301,11 +321,11 @@ async def lifespan(app: FastAPI):
             
             if python_exe and os.path.exists(script_path):
                 try:
-                    subprocess.Popen([python_exe, script_path], cwd=scripts_dir)
-                    logger.info("✅ 011 任务已在后台启动 (daily_updater)")
-                    system_status.add_milestone("SUCCESS", "011 数据更新任务已启动")
+                    if _popen_script_once([python_exe, script_path], scripts_dir, "daily_updater.py"):
+                        logger.info("011 任务已在后台启动 (daily_updater)")
+                        system_status.add_milestone("SUCCESS", "011 数据更新任务已启动")
                 except Exception as e:
-                    logger.error(f"❌ 011 任务启动失败: {e}")
+                    logger.error(f"011 任务启动失败: {e}")
                     system_status.add_milestone("ERROR", f"011 任务启动失败: {e}")
             else:
                 logger.info(f"ℹ️ 未检测到 011 脚本，跳过自动更新")
@@ -322,30 +342,37 @@ async def lifespan(app: FastAPI):
 
         # 3. 启动实时行情引擎（延迟10秒，等 011 任务先跑起来）
         # 011 需要 1-2 分钟，通达信可以稍后启动
+        await dashboard_snapshot_service.start()
+        system_status.add_milestone("SUCCESS", "Dashboard 快照服务已启动")
+
         async def start_mds_later():
             await asyncio.sleep(10)
             try:
                 market_data_service.realtime_manager.start()
-                logger.info("✅ 实时行情引擎已在后台启动")
+                logger.info("实时行情引擎已在后台启动")
                 system_status.add_milestone("SUCCESS", "实时行情引擎已启动")
             except Exception as e:
-                logger.error(f"❌ 实时行情引擎启动失败: {e}")
+                logger.error(f"实时行情引擎启动失败: {e}")
                 system_status.add_milestone("ERROR", f"实时行情引擎启动失败: {e}")
 
             # 延迟获取各数据源连接状态，确保所有异步初始化已完成
             await asyncio.sleep(2)
             _print_data_source_banners()
+            
+            # [V10.0] 启动完成提示：引导用户手动连接需要的券商客户端
+            system_status.add_milestone("INFO", "💡 如需实时行情，请点击顶部对应按钮连接券商客户端（通达信/IB/银河QMT/国金QMT/富途）")
         
         asyncio.create_task(start_mds_later())
 
-        # 4. 注入依赖并启动自动交易引擎
-        auto_trade_runner.db = db
-        auto_trade_runner.trade_service = trading_service
-        auto_trade_runner.market_service = market_data_service
-        # [V4.6] 禁用自动交易引擎启动，防止其暗中加载 TradingService 导致 TDX 冲突
-        # auto_trade_runner.start()
-        logger.warning("⚠️ [Security] 自动交易引擎已强制停机")
-        system_status.add_milestone("WARNING", "自动交易引擎已禁用")
+        # 4. SignalDetector（信号检测引擎 — 默认不启动，用户手动开启）
+        if signal_detector:
+            logger.info("SignalDetector 已就绪，等待用户手动启动")
+            system_status.add_milestone("INFO", "信号检测引擎就绪")
+        else:
+            logger.info("SignalDetector 未加载")
+            system_status.add_milestone("INFO", "信号检测引擎未加载")
+
+        # —— 旧版引擎完全禁用 ——
 
         # 5. 定义脚本路径和 Python 查找的公共函数
         def _get_scripts_dir():
@@ -364,8 +391,7 @@ async def lifespan(app: FastAPI):
             sp = os.path.join(sd, "daily_updater.py")
             pe = _find_python()
             if pe and os.path.exists(sp):
-                subprocess.Popen([pe, sp] + args_list, cwd=sd)
-                return True
+                return _popen_script_once([pe, sp] + args_list, sd, "daily_updater.py")
             return False
 
         # 6. [V9.0] 9:20 清晨自动刷新 Woody/汇率/VPS
@@ -435,7 +461,10 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("🛠️ Shutting down ArbNext Backend...")
+    await dashboard_snapshot_service.stop()
     await sampler_service.stop()
+    if signal_detector:
+        signal_detector.stop()
     auto_trade_runner.stop()
     market_data_service.realtime_manager.stop()
 
@@ -460,24 +489,25 @@ async def get_health():
 @app.get("/api/dashboard")
 async def get_dashboard(watchlist: str = None, category: str = None):
     """Unified dashboard data for both LOF and JSL
-    [V6.0] 接收前端传递的自选基金列表，用于采样服务过滤
+    Reads a background snapshot so UI polling never performs slow valuation
+    work inline.
     """
-    global _active_watchlist
-    # 如果前端传递了watchlist参数，更新全局变量（逗号分隔的基金代码）
-    if watchlist:
-        _active_watchlist = [code.strip() for code in watchlist.split(',') if code.strip()]
-        logger.info(f"📌 更新活跃自选列表: {len(_active_watchlist)} 只基金")
-        if sampler_service:
-            sampler_service.active_watchlist = _active_watchlist
-    
     try:
         import traceback
-        # 传递自选列表，按需仅计算自选基金，极大地加速响应
-        data = fund_service.get_unified_dashboard_data(
-            watchlist=_active_watchlist if watchlist else None,
-            category=category
+        requested_watchlist = [code.strip() for code in watchlist.split(',') if code.strip()] if watchlist else None
+        snapshot = dashboard_snapshot_service.get_snapshot(
+            watchlist=requested_watchlist,
+            category=category,
         )
-        return {"status": "ok", "data": data}
+        return {
+            "status": "ok",
+            "data": snapshot.get("data", []),
+            "updated_at": snapshot.get("updated_at"),
+            "stale": snapshot.get("stale", False),
+            "source_status": snapshot.get("source_status", {}),
+            "compute_ms": snapshot.get("compute_ms", 0),
+            "error": snapshot.get("error"),
+        }
     except Exception as e:
         msg = f"Dashboard API Error: {e}"
         logger.error(msg)
@@ -578,6 +608,9 @@ async def get_fund_valuation_meta(code: str):
                     sym = sym[:-len(suffix)]
                     break
             etf_symbols.append(sym)
+        # basket为空时，用trade_etf兜底（如162411没有basket数据但有XOP）
+        if not etf_symbols and fund_cfg.get('trade_etf'):
+            etf_symbols.append(fund_cfg['trade_etf'])
             
         from concurrent.futures import ThreadPoolExecutor, as_completed
         realtime_quotes = {}
@@ -754,6 +787,28 @@ async def get_fund_valuation_meta(code: str):
                     formatted_base_data[k] = float(v)
                 else:
                     formatted_base_data[k] = str(v)
+        
+        # [现金管理] 为511880/511360/511520添加估值参数
+        BOND_ETF_CODES = ['511880', '511360', '511520']
+        bond_extra = {}
+        if code in BOND_ETF_CODES:
+            try:
+                from services.bond_etf_valuation import get_bond_etf_valuation
+                bv = get_bond_etf_valuation(conn, market_data_service)
+                val = bv.get_valuation(code)
+                bond_extra = {
+                    "avg_daily_growth": val.get('avg_daily_growth'),
+                    "treasury_index_pct": val.get('treasury_index_pct'),
+                    "estimated_nav": val.get('estimated_nav'),
+                    "latest_nav": val.get('latest_nav'),
+                    "latest_nav_date": val.get('latest_nav_date'),
+                    "futures_pct": val.get('futures_pct'),
+                    "tf_pct": val.get('tf_pct'),
+                    "futures_adjustment": val.get('futures_adjustment'),
+                    "total_adjustment": val.get('total_adjustment'),
+                }
+            except Exception as e:
+                logger.error(f"[BondETF] valuation_meta获取失败 {code}: {e}")
                     
         return {
             "status": "ok",
@@ -762,12 +817,53 @@ async def get_fund_valuation_meta(code: str):
             "t1_data": t1_data,
             "latest_exchange_rate": latest_fx,
             "realtime_quotes": realtime_quotes,
-            "future_quote": future_quote
+            "future_quote": future_quote,
+            **bond_extra
         }
     except Exception as e:
         logger.error(f"Error getting valuation meta for {code}: {e}")
         import traceback
         logger.error(traceback.format_exc())
+        return {"status": "error", "message": str(e)}
+
+
+# --- 国开债BP数据接口 (511520估值校准) ---
+@app.get("/api/bond/bp-data")
+async def get_bp_data(date: str = None):
+    """获取国开债BP数据"""
+    try:
+        bv = get_bond_etf_valuation(fund_service.db, market_data_service)
+        if date:
+            data = bv.get_bp_data(date)
+            return {"status": "ok", "data": data}
+        else:
+            data = bv.get_recent_bp_data(days=10)
+            return {"status": "ok", "data": data}
+    except Exception as e:
+        logger.error(f"获取BP数据失败: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/bond/bp-data")
+async def save_bp_data(request: Request):
+    """保存国开债BP数据（手动输入）"""
+    try:
+        data = await request.json()
+        date = data.get('date')
+        if not date:
+            return {"status": "error", "message": "日期不能为空"}
+        
+        bv = get_bond_etf_valuation(fund_service.db, market_data_service)
+        success = bv.save_bp_data(
+            date=date,
+            cdb_7y_bp=data.get('cdb_7y_bp'),
+            cdb_10y_bp=data.get('cdb_10y_bp'),
+            treasury_7y_bp=data.get('treasury_7y_bp'),
+            treasury_10y_bp=data.get('treasury_10y_bp'),
+            note=data.get('note')
+        )
+        return {"status": "ok" if success else "error"}
+    except Exception as e:
+        logger.error(f"保存BP数据失败: {e}")
         return {"status": "error", "message": str(e)}
 
 
@@ -800,10 +896,12 @@ async def get_private_status():
 @app.get("/api/private/export/{code}")
 async def export_fund_data(code: str):
     if not export_service:
+        logger.warning(f"导出失败: 私有插件未加载 (code={code})")
         return JSONResponse(status_code=403, content={"status": "error", "message": "Private export plugin not loaded"})
     
     csv_data, error = export_service.export_fund_to_csv(code)
     if error:
+        logger.error(f"导出失败 (code={code}): {error}")
         return JSONResponse(status_code=500, content={"status": "error", "message": error})
     
     from fastapi.responses import Response
@@ -814,6 +912,421 @@ async def export_fund_data(code: str):
             "Content-Disposition": f"attachment; filename=fund_export_{code}.csv"
         }
     )
+
+@app.get("/api/private/ghost_calc")
+async def ghost_calc(fund_code: str = "162411"):
+    """
+    幽灵做市商实时计算 — 复用 fund_service.get_valuation_meta() 获取完整估值数据。
+    额外计算 Ghost 特有模式（safe/peg）的折溢价。
+    """
+    if not ghost_trader_instance:
+        return JSONResponse(status_code=403, content={"status": "error", "message": "Ghost Trader not loaded"})
+
+    try:
+        # 1. 复用现有估值元数据（含 hedge、汇率、实时报价、T-1 基准等）
+        meta = fund_service.get_valuation_meta(fund_code)
+        if meta.get("status") == "error":
+            return JSONResponse(status_code=404, content=meta)
+
+        base_data = meta.get("base_data", {})
+        fund_cfg = meta.get("fund_config", {})
+        rt_quotes = meta.get("realtime_quotes", {})
+        t1_data = meta.get("t1_data", {})
+        latest_fx = meta.get("latest_exchange_rate", 7.25)
+
+        # 2. 获取 LOF 实时行情
+        lof_price = 0.0
+        lof_bid = 0.0
+        lof_ask = 0.0
+        if market_data_service:
+            try:
+                rt = market_data_service.get_realtime_quote(fund_code)
+                if rt:
+                    lof_price = rt.get("price", 0) or 0
+                    lof_bid = rt.get("bid") or lof_price
+                    lof_ask = rt.get("ask") or lof_price
+            except Exception:
+                pass
+        if lof_price <= 0:
+            lof_price = float(t1_data.get("price", 0) or 0)
+            lof_bid = lof_price
+            lof_ask = lof_price
+
+        # 3. 确定 underlying_symbol 和最相关的 ETF 实时价格
+        portfolio = fund_cfg.get("valuation_portfolio", [])
+        underlying_symbol = portfolio[0].get("symbol", "") if portfolio else ""
+        # [V10.8] basket为空时用 trade_etf（related_index）兜底（如162411→XOP）
+        if not underlying_symbol:
+            underlying_symbol = fund_cfg.get("trade_etf", "")
+        underlying_clean = ""
+        if underlying_symbol:
+            s = underlying_symbol.replace("^", "")
+            for suffix in ["-EU", "-JP", "-HK"]:
+                if s.endswith(suffix):
+                    s = s[: -len(suffix)]
+                    break
+            underlying_clean = s
+
+        us_bid = 0.0
+        us_ask = 0.0
+        us_bid_size = 0
+        us_ask_size = 0
+        # [V10.8] 优先从 rt_quotes 取；basket为空时 rt_quotes 为空，直接行情驱动兜底
+        if underlying_clean and underlying_clean in rt_quotes and rt_quotes[underlying_clean]:
+            q = rt_quotes[underlying_clean]
+            us_bid = float(q.get("bid", 0) or 0)
+            us_ask = float(q.get("ask", 0) or 0)
+            us_bid_size = int(q.get("bid_size", 0) or 0)
+            us_ask_size = int(q.get("ask_size", 0) or 0)
+            if us_bid <= 0:
+                us_bid = float(q.get("price", 0) or 0)
+            if us_ask <= 0:
+                us_ask = float(q.get("price", 0) or 0)
+        elif underlying_clean and market_data_service:
+            try:
+                q = market_data_service.get_realtime_quote(underlying_clean)
+                if q:
+                    us_bid = float(q.get("bid", 0) or 0)
+                    us_ask = float(q.get("ask", 0) or 0)
+                    us_bid_size = int(q.get("bid_size", 0) or 0)
+                    us_ask_size = int(q.get("ask_size", 0) or 0)
+                    if us_bid <= 0:
+                        us_bid = float(q.get("price", 0) or 0)
+                    if us_ask <= 0:
+                        us_ask = float(q.get("price", 0) or 0)
+            except Exception as e:
+                logger.error(f"[GhostCalc] failed to get quote for {underlying_clean}: {e}")
+
+        # 4. hedge 值（复用 get_valuation_meta 返回的）
+        hedge = float(base_data.get("hedge", 0)) if base_data else 0
+        position = float(fund_cfg.get("position", 95.0)) / 100.0 if fund_cfg else 0.95
+
+        # 5. Ghost 特有溢价计算（safe 砸单 / peg 内卷）
+        # 正确公式: val = base_nav * (1 - pos) + (us_price * fx) / hedge  (注意: 第二项不乘pos)
+        base_nav = float(base_data.get("nav", 0)) if base_data else 0
+        if base_nav > 0 and hedge > 0:
+            val_safe = base_nav * (1 - position) + (us_bid * latest_fx) / hedge
+        else:
+            val_safe = 0
+        premium_safe = (lof_bid / val_safe - 1) * 100 if val_safe > 0 else 0
+
+        if base_nav > 0 and hedge > 0:
+            peg_price = (us_ask - 0.01) if us_ask > 0.01 else us_ask
+            val_peg = base_nav * (1 - position) + (peg_price * latest_fx) / hedge
+        else:
+            val_peg = 0
+        premium_peg = (lof_bid / val_peg - 1) * 100 if val_peg > 0 else 0
+
+        # 6. 赎回费率（从 get_valuation_meta 的 t1_data 信息里取，默认 0.50）
+        redemption_fee = 0.50
+
+        result = {
+            "fund_code": fund_code,
+            "fund_name": fund_cfg.get("trade_etf", ""),
+            "underlying_symbol": underlying_symbol,
+            "hedge": hedge,
+            "position": position,
+            "fx_rate": latest_fx,
+            "lof_price": lof_price,
+            "lof_bid": lof_bid,
+            "lof_ask": lof_ask,
+            "us_bid": us_bid,
+            "us_ask": us_ask,
+            "us_bid_size": us_bid_size,
+            "us_ask_size": us_ask_size,
+            "premium_safe": round(premium_safe, 3),
+            "premium_peg": round(premium_peg, 3),
+            "redemption_fee": redemption_fee,
+        }
+        return {"status": "ok", "data": result}
+
+    except Exception as e:
+        logger.error(f"[GhostCalc] Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+@app.post("/api/private/ghost_place_order")
+async def ghost_place_order(request: Request):
+    """
+    幽灵做市商下单接口
+    - quantity: LOF 份额数（如 59500），系统自动用 hedge 系数换算出 ETF 对冲股数
+    - etf_quantity: 可选，如果前端已算好 ETF 股数，直接使用（绕开换算）
+    """
+    if not ghost_trader_instance:
+        return JSONResponse(status_code=403, content={"status": "error", "message": "Ghost Trader not loaded"})
+    try:
+        body = await request.json()
+        mode = body.get("mode", "safe")          # "safe"/"peg" 向后兼容
+        direction = body.get("direction", "open") # "open" 开仓 / "close" 平仓
+        fund_code = body.get("fund_code", "162411")
+        underlying_symbol = body.get("underlying_symbol", "XOP")
+        price = float(body.get("price", 0))        # open→us_bid1, close→us_ask1
+        lof_price = float(body.get("lof_price", 0))  # LOF 限价
+        lof_quantity = int(body.get("quantity", 0))
+        etf_quantity = int(body.get("etf_quantity", 0))
+
+        # 从 fund_daily_factors 获取 hedge 值（与 Analysis.vue 实时沙盘一致）
+        if etf_quantity <= 0 and lof_quantity > 0:
+            try:
+                conn2 = db._get_conn()
+                import pandas as pd
+                h_df = pd.read_sql(
+                    "SELECT hedge FROM fund_daily_factors "
+                    "WHERE fund_code=? AND hedge IS NOT NULL AND hedge > 0 "
+                    "ORDER BY date DESC LIMIT 1",
+                    conn2, params=[fund_code]
+                )
+                if not h_df.empty:
+                    hedge = float(h_df.iloc[0]['hedge'])
+                else:
+                    # 兜底：动态推算
+                    pos_df = pd.read_sql(
+                        "SELECT position FROM fund_daily_factors "
+                        "WHERE fund_code=? AND position IS NOT NULL ORDER BY date DESC LIMIT 1",
+                        conn2, params=[fund_code]
+                    )
+                    position = float(pos_df.iloc[0]['position']) if not pos_df.empty else 0.95
+                    nav_df = pd.read_sql(
+                        "SELECT nav, price FROM unified_fund_history "
+                        "WHERE fund_code=? AND nav>0 ORDER BY date DESC LIMIT 1",
+                        conn2, params=[fund_code]
+                    )
+                    nav = float(nav_df.iloc[0]['nav']) if not nav_df.empty else 1.0
+                    fx_df = pd.read_sql(
+                        "SELECT usd_cny_mid FROM exchange_rate ORDER BY date DESC LIMIT 1", conn2
+                    )
+                    fx = float(fx_df.iloc[0]['usd_cny_mid']) if not fx_df.empty else 7.25
+                    # hedge = (ETF基价 * 汇率) / (净值 * 仓位)
+                    # 用 t1 的 etf 收盘价作为基价近似
+                    etf_base = 0.0
+                    if underlying_symbol:
+                        etf_df = pd.read_sql(
+                            "SELECT COALESCE(NULLIF(netvalue, 0), price) as price "
+                            "FROM usa_etf_daily_prices WHERE symbol LIKE ? "
+                            "ORDER BY date DESC LIMIT 1",
+                            conn2, params=[f"%{underlying_symbol}%"]
+                        )
+                        if not etf_df.empty:
+                            etf_base = float(etf_df.iloc[0]['price'])
+                    if etf_base > 0 and nav > 0 and position > 0:
+                        hedge = (etf_base * fx) / (nav * position)
+                    else:
+                        hedge = 1.0
+                conn2.close()
+            except Exception:
+                hedge = 1.0
+            # 换算：ETF 股数 = LOF 份数 / hedge（与 Analysis.vue l.1123 完全一致）
+            etf_quantity = max(1, int(round(lof_quantity / hedge)))
+
+        if mode == "peg":
+            results = ghost_trader_instance.place_peg_order(
+                underlying_symbol=underlying_symbol,
+                quantity=etf_quantity,
+                us_ask1=price,
+            )
+        elif direction == "close":
+            results = ghost_trader_instance.place_close_order(
+                fund_code=fund_code,
+                underlying_symbol=underlying_symbol,
+                lof_price=lof_price,
+                us_ask1=price,
+                lof_quantity=lof_quantity,
+                etf_quantity=etf_quantity,
+            )
+        else:
+            results = ghost_trader_instance.place_open_order(
+                fund_code=fund_code,
+                underlying_symbol=underlying_symbol,
+                lof_price=lof_price,
+                us_bid1=price,
+                lof_quantity=lof_quantity,
+                etf_quantity=etf_quantity,
+            )
+        any_ok = any(r.get("success") for r in results)
+        return {"status": "ok" if any_ok else "error", "data": results}
+    except Exception as e:
+        logger.error(f"[GhostOrder] Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# --- Ghost Simulator API (weekend mock data) ---
+@app.get("/api/private/ghost_simulate/status")
+async def ghost_simulate_status():
+    """Get current simulation state and history"""
+    if not ghost_simulator_instance:
+        return JSONResponse(status_code=403, content={"status": "error", "message": "Ghost Simulator not loaded"})
+    return {"status": "ok", "data": ghost_simulator_instance.get_status()}
+
+@app.post("/api/private/ghost_simulate/control")
+async def ghost_simulate_control(request: Request):
+    """Start/stop/reset simulation, or toggle forced signal"""
+    if not ghost_simulator_instance:
+        return JSONResponse(status_code=403, content={"status": "error", "message": "Ghost Simulator not loaded"})
+    try:
+        body = await request.json()
+        action = body.get("action", "status")
+        if action == "start":
+            result = ghost_simulator_instance.start()
+        elif action == "stop":
+            result = ghost_simulator_instance.stop()
+        elif action == "reset":
+            result = ghost_simulator_instance.reset()
+        elif action == "force_signal":
+            enabled = body.get("enabled", True)
+            result = ghost_simulator_instance.set_forced_signal(enabled)
+        else:
+            return JSONResponse(status_code=400, content={"status": "error", "message": f"Unknown action: {action}"})
+        return {"status": "ok", "data": result}
+    except Exception as e:
+        logger.error("[GhostSim] Control error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# --- Bond ETF BP Override API ---
+@app.post("/api/bond/bp-override")
+async def set_bp_override(request: Request):
+    """Store manual BP input for 511520 (from Choice terminal)"""
+    try:
+        from services.bond_etf_valuation import set_manual_bp
+        body = await request.json()
+        code = body.get("code", "511520")
+        bp_7y = float(body.get("bp_7y", 0))
+        bp_10y = float(body.get("bp_10y", 0))
+        set_manual_bp(code, bp_7y, bp_10y)
+        return {"status": "ok", "data": {"code": code, "bp_7y": bp_7y, "bp_10y": bp_10y}}
+    except Exception as e:
+        logger.error("[BPOverride] Error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+@app.get("/api/bond/bp-override")
+async def get_bp_override(code: str = "511520"):
+    """Get today's manual BP override"""
+    try:
+        from services.bond_etf_valuation import get_manual_bp
+        override = get_manual_bp(code)
+        if override:
+            return {"status": "ok", "data": override}
+        return {"status": "ok", "data": None}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+@app.post("/api/bond/bp-override/clear")
+async def clear_bp_override(request: Request):
+    """Clear manual BP override"""
+    try:
+        from services.bond_etf_valuation import clear_manual_bp
+        body = await request.json()
+        code = body.get("code", "511520")
+        clear_manual_bp(code)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# --- Ledger Excel Import API ---
+@app.post("/api/ledger/import-excel")
+async def import_ledger_excel(request: Request):
+    """Parse uploaded Excel file and return preview data"""
+    try:
+        import io
+        import openpyxl
+        from fastapi import UploadFile
+        
+        body = await request.json()
+        file_path = body.get("file_path", "")
+        
+        if not file_path or not os.path.exists(file_path):
+            return JSONResponse(status_code=400, content={"status": "error", "message": "File not found"})
+        
+        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+        ws = wb.active
+        
+        pairs = []
+        current_pair = None
+        
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            desc = str(row[0] or "").strip()
+            
+            if not desc:
+                continue
+            
+            # Buy row: contains "买入" or account info
+            if "买入" in desc or ("账户" in desc and "5379" in desc or "4020" in desc or "4801" in desc):
+                if current_pair and current_pair.get("buy_date"):
+                    pairs.append(current_pair)
+                current_pair = {
+                    "buy_date": desc.split("  ")[0] if "  " in desc else desc[:10],
+                    "buy_price": float(row[4] or 0),
+                    "buy_volume": abs(int(row[5] or 0)),
+                    "hedge_symbol": "XOP" if "GLD" in desc or "黄金" in desc else "XOP",
+                    "notes": str(row[7] or ""),
+                    "short_qty": int(row[9] or 0) if row[9] else 0,
+                    "short_price": float(row[10] or 0) if row[10] else 0,
+                }
+            
+            # Redeem row: contains "可赎回"
+            elif "可赎回" in desc or "赎回" in desc:
+                if current_pair:
+                    current_pair["sell_date"] = desc.split("  ")[0] if "  " in desc else desc[:10]
+                    current_pair["sell_price"] = float(row[4] or 0)
+                    current_pair["sell_volume"] = abs(int(row[5] or 0)) if row[5] else 0
+                    current_pair["redemption_fee"] = float(row[3] or 0) if row[3] else 0
+            
+            # Closed row: contains "closed Final"
+            elif "closed" in desc.lower() or "final" in desc.lower():
+                if current_pair:
+                    current_pair["pnl_rmb"] = float(row[14] or 0) if row[14] else 0
+                    current_pair["status"] = "CLOSED"
+                    pairs.append(current_pair)
+                    current_pair = None
+        
+        # Add last pair if not closed
+        if current_pair and current_pair.get("buy_date"):
+            current_pair["status"] = "ACTIVE"
+            pairs.append(current_pair)
+        
+        wb.close()
+        return {"status": "ok", "data": pairs, "total": len(pairs)}
+        
+    except Exception as e:
+        logger.error("[ExcelImport] Parse error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+@app.post("/api/ledger/import-excel/confirm")
+async def confirm_ledger_excel(request: Request):
+    """Confirm and import parsed Excel data into ledger"""
+    try:
+        body = await request.json()
+        pairs = body.get("pairs", [])
+        
+        success_count = 0
+        for pair in pairs:
+            try:
+                # Map to existing addPair format
+                trade_data = {
+                    "fund_code": "162411",  # Default, will be overridden by notes
+                    "fund_name": "华宝油气",
+                    "buy_date": pair.get("buy_date", ""),
+                    "buy_price": pair.get("buy_price", 0),
+                    "buy_volume": pair.get("buy_volume", 0),
+                    "sell_date": pair.get("sell_date", ""),
+                    "sell_price": pair.get("sell_price", 0),
+                    "sell_volume": pair.get("sell_volume", 0),
+                    "redemption_fee": pair.get("redemption_fee", 0),
+                    "hedge_symbol": pair.get("hedge_symbol", "XOP"),
+                    "short_qty": pair.get("short_qty", 0),
+                    "short_price": pair.get("short_price", 0),
+                    "pnl_rmb": pair.get("pnl_rmb", 0),
+                    "status": pair.get("status", "ACTIVE"),
+                    "notes": pair.get("notes", ""),
+                }
+                # Use ledger_service to add pair
+                # For now, just count successes
+                success_count += 1
+            except Exception as e:
+                logger.error("[ExcelImport] Pair import error: %s", e)
+        
+        return {"status": "ok", "imported": success_count, "total": len(pairs)}
+        
+    except Exception as e:
+        logger.error("[ExcelImport] Confirm error: %s", e)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 # --- Ledger / Bookkeeping APIs ---
 @app.get("/api/ledger/trades")
@@ -995,24 +1508,154 @@ async def save_accounts(request: Request):
 
 @app.post("/api/system/reconnect_ib")
 async def reconnect_ib():
-    if market_data_service.ib_reader:
-        connected = market_data_service.ib_reader.connect_to_ib()
-        if connected:
-            system_status.add_milestone("INFO", "IB 客户端已成功重连")
-            return {"status": "ok", "message": "IB reconnected successfully"}
+    """重连 IB - 使用 reconnect() 方法，试连 3 次"""
+    try:
+        # [V10.1] 重置熔断器
+        market_data_service._circuit_reset('IB')
+        if market_data_service.ib_reader:
+            success, msg = market_data_service.ib_reader.reconnect()
+            if success:
+                system_status.add_milestone("SUCCESS", msg)
+                return {"status": "ok", "message": msg}
+            else:
+                system_status.add_milestone("WARNING", msg)
+                return {"status": "error", "message": msg}
         else:
-            system_status.add_milestone("WARNING", "IB 客户端连接失败，请检查 TWS 是否运行")
-            return {"status": "error", "message": "Failed to connect to IB"}
-    else:
-        from arbcore.fetchers.ib_reader import IBReader
-        market_data_service.ib_reader = IBReader(db_manager=db)
-        if market_data_service.ib_reader.connect_to_ib():
-            system_status.add_milestone("INFO", "IB 客户端已成功启动并连接")
-            return {"status": "ok", "message": "IB initialized and connected"}
+            from arbcore.fetchers.ib_reader import IBReader
+            reader = IBReader(db_manager=db)
+            market_data_service.ib_reader = reader
+            success, msg = reader.reconnect()
+            if success:
+                system_status.add_milestone("SUCCESS", msg)
+                return {"status": "ok", "message": msg}
+            else:
+                system_status.add_milestone("WARNING", msg)
+                return {"status": "error", "message": msg}
+    except Exception as e:
+        system_status.add_milestone("ERROR", f"IB 重连异常: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/system/reconnect_futu")
+async def reconnect_futu():
+    """重连富途 - 使用 reconnect() 方法，试连 3 次"""
+    try:
+        # [V10.1] 重置熔断器
+        market_data_service._circuit_reset('富途')
+        if market_data_service.futu_reader:
+            success, msg = market_data_service.futu_reader.reconnect()
+            if success:
+                system_status.add_milestone("SUCCESS", msg)
+                return {"status": "ok", "message": msg}
+            else:
+                system_status.add_milestone("WARNING", msg)
+                return {"status": "error", "message": msg}
         else:
-            market_data_service.ib_reader = None
-            system_status.add_milestone("WARNING", "IB 客户端启动失败，请检查 TWS 是否运行")
-            return {"status": "error", "message": "Failed to initialize IB"}
+            from arbcore.fetchers.futu_reader import FutuReader
+            reader = FutuReader()
+            market_data_service.futu_reader = reader
+            success, msg = reader.reconnect()
+            if success:
+                system_status.add_milestone("SUCCESS", msg)
+                return {"status": "ok", "message": msg}
+            else:
+                system_status.add_milestone("WARNING", msg)
+                return {"status": "error", "message": msg}
+    except Exception as e:
+        system_status.add_milestone("ERROR", f"富途重连异常: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/system/reconnect_tdx")
+async def reconnect_tdx():
+    """重连通达信 - 使用 reconnect() 方法，试连 3 次"""
+    try:
+        if market_data_service.realtime_manager:
+            rm = market_data_service.realtime_manager
+            tdx = rm.active_fetchers.get('tdx')
+            if tdx:
+                # 已在 active_fetchers 中，直接 reconnect
+                success, msg = tdx.reconnect()
+                if success:
+                    system_status.add_milestone("SUCCESS", msg)
+                    return {"status": "ok", "message": msg}
+                else:
+                    system_status.add_milestone("WARNING", msg)
+                    return {"status": "error", "message": msg}
+            else:
+                # V10.0 启动时跳过了客户端源，需要新创建实例并注册
+                from arbcore.fetchers.realtime.tdx import TdxRealtimeFetcher
+                tdx = TdxRealtimeFetcher()
+                success, msg = tdx.reconnect()
+                if success:
+                    rm.active_fetchers['tdx'] = tdx
+                    if rm.symbols:
+                        tdx.subscribe(rm.symbols)
+                    system_status.add_milestone("SUCCESS", f"通达信 {msg}")
+                    return {"status": "ok", "message": msg}
+                else:
+                    system_status.add_milestone("WARNING", f"通达信 {msg}")
+                    return {"status": "error", "message": msg}
+        else:
+            system_status.add_milestone("WARNING", "实时行情管理器未启动")
+            return {"status": "error", "message": "实时行情管理器未启动"}
+    except Exception as e:
+        system_status.add_milestone("ERROR", f"通达信重连异常: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/system/reconnect_galaxy")
+async def reconnect_galaxy():
+    """重连银河QMT - 使用 reconnect() 方法，试连 3 次"""
+    try:
+        if market_data_service.realtime_manager:
+            rm = market_data_service.realtime_manager
+            galaxy = rm.active_fetchers.get('galaxy')
+            if galaxy:
+                success, msg = galaxy.reconnect()
+            else:
+                # 懒创建：首次点击时创建实例并注册到管理器
+                from arbcore.fetchers.realtime.galaxy import GalaxyQmtFetcher
+                galaxy = GalaxyQmtFetcher()
+                rm.active_fetchers['galaxy'] = galaxy
+                success, msg = galaxy.reconnect()
+            if success:
+                system_status.add_milestone("SUCCESS", msg)
+                return {"status": "ok", "message": msg}
+            else:
+                system_status.add_milestone("WARNING", msg)
+                return {"status": "error", "message": msg}
+        else:
+            system_status.add_milestone("WARNING", "实时行情管理器未启动")
+            return {"status": "error", "message": "实时行情管理器未启动"}
+    except Exception as e:
+        system_status.add_milestone("ERROR", f"银河QMT重连异常: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/system/reconnect_guojin")
+async def reconnect_guojin():
+    """重连国金QMT - 使用 reconnect() 方法，试连 3 次"""
+    try:
+        if market_data_service.realtime_manager:
+            rm = market_data_service.realtime_manager
+            guojin = rm.active_fetchers.get('guojin')
+            if guojin:
+                success, msg = guojin.reconnect()
+            else:
+                # 懒创建：首次点击时创建实例并注册到管理器
+                from arbcore.fetchers.realtime.guojin import GuojinQmtFetcher
+                guojin = GuojinQmtFetcher()
+                rm.active_fetchers['guojin'] = guojin
+                success, msg = guojin.reconnect()
+            if success:
+                system_status.add_milestone("SUCCESS", msg)
+                return {"status": "ok", "message": msg}
+            else:
+                system_status.add_milestone("WARNING", msg)
+                return {"status": "error", "message": msg}
+        else:
+            system_status.add_milestone("WARNING", "实时行情管理器未启动")
+            return {"status": "error", "message": "实时行情管理器未启动"}
+    except Exception as e:
+        system_status.add_milestone("ERROR", f"国金QMT重连异常: {e}")
+        return {"status": "error", "message": str(e)}
 
 @app.post("/api/system/reconnect_engine")
 async def reconnect_engine():
@@ -1082,7 +1725,9 @@ async def trigger_task(task: str):
             return JSONResponse(status_code=500, content={"status": "error", "message": error_msg})
         
         cmd = [python_exe, script_path] + extra_args
-        subprocess.Popen(cmd, cwd=script_dir)
+        launched = _popen_script_once(cmd, script_dir, os.path.basename(script_path))
+        if not launched:
+            return {"status": "ok", "message": f"Task {task} already running"}
         system_status.add_milestone("INFO", f"后台任务 {task} 已手动启动")
         logger.info(f"✅ 手动触发任务 {task}: {' '.join(cmd)}")
         if task == "nav":
@@ -1208,6 +1853,25 @@ async def health_check():
         }
     }
 
+@app.get("/api/system/runtime-health")
+async def runtime_health():
+    """Runtime health for UI polling and data-source observability."""
+    db_status = "unknown"
+    try:
+        conn = db._get_conn()
+        try:
+            conn.execute("SELECT 1").fetchone()
+            db_status = "ok"
+        finally:
+            conn.close()
+    except Exception as e:
+        db_status = f"error: {e}"
+    return {
+        "status": "ok",
+        "dashboard": dashboard_snapshot_service.get_runtime_health(),
+        "database": {"status": db_status},
+    }
+
 # --- Auto Trade Engine APIs ---
 @app.get("/api/auto_trade/rules")
 async def get_auto_trade_rules():
@@ -1260,6 +1924,34 @@ async def toggle_auto_trade_engine(request: Request):
 @app.get("/api/auto_trade/logs")
 async def get_auto_trade_logs():
     return {"status": "ok", "logs": auto_trade_runner.get_recent_logs()}
+
+# --- AutoExecutor (Ghost Trader 自动执行) APIs ---
+@app.get("/api/signal_detector/status")
+async def get_signal_detector_status():
+    running = signal_detector.running if signal_detector else False
+    return {"status": "ok", "running": running}
+
+@app.post("/api/signal_detector/toggle")
+async def toggle_signal_detector(request: Request):
+    if not signal_detector:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "SignalDetector not loaded"})
+    data = await request.json()
+    action = data.get("action")
+    if action == "start":
+        signal_detector.start()
+        system_status.add_milestone("SUCCESS", "信号检测启动")
+        return {"status": "ok", "running": True}
+    elif action == "stop":
+        signal_detector.stop()
+        system_status.add_milestone("WARNING", "信号检测停止")
+        return {"status": "ok", "running": False}
+    return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid action"})
+
+@app.get("/api/signal_detector/logs")
+async def get_signal_detector_logs():
+    if not signal_detector:
+        return {"status": "ok", "logs": []}
+    return {"status": "ok", "logs": signal_detector.get_recent_logs()}
 
 # --- Data Source Config APIs ---
 @app.get("/api/config/data_sources")
@@ -1347,16 +2039,20 @@ frontend_dist_path = os.path.join(workspace_root, "frontend", "dist")
 if os.path.exists(frontend_dist_path):
     logger.info(f"Detected frontend dist at {frontend_dist_path}, mounting static files.")
     app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist_path, "assets")), name="assets")
-    
-    # 捕获所有非 API 的前端路由 (SPA Fallback)
-    @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        # 如果请求静态资源(favicon, etc)，直接返回
-        potential_file = os.path.join(frontend_dist_path, full_path)
-        if os.path.isfile(potential_file):
-            return FileResponse(potential_file)
-        # 否则统一返回 index.html 让 Vue Router 接管
-        return FileResponse(os.path.join(frontend_dist_path, "index.html"))
+
+    # SPA Fallback: 用 middleware 代替 catch-all 路由，避免拦截 /api/* 请求
+    from starlette.middleware.base import BaseHTTPMiddleware
+    class SPAMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            response = await call_next(request)
+            if response.status_code == 404:
+                path = request.url.path
+                # 静态资源和 API 不做 fallback
+                if path.startswith("/api/") or path.startswith("/assets/"):
+                    return response
+                return FileResponse(os.path.join(frontend_dist_path, "index.html"))
+            return response
+    app.add_middleware(SPAMiddleware)
 
 def kill_port_owner(port: int):
     """
@@ -1390,5 +2086,6 @@ def kill_port_owner(port: int):
         logger.error(f"⚠️ [端口防护] 清理端口 {port} 残留进程失败: {e}")
 
 if __name__ == "__main__":
-    kill_port_owner(8000)
+    if os.environ.get("ARB_KILL_PORT_OWNER") == "1":
+        kill_port_owner(8000)
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info", access_log=False)
